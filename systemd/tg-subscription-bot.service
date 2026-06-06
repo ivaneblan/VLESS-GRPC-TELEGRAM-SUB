@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram VPN subscription bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/ssh
+Environment=APPROVER_USER_ID=0
+Environment=BROADCAST_ONLY_APPROVER=1
+Environment=APPROVER_USERNAME=admin
+ExecStart=/root/ssh/tgbot
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+# Рабочее состояние — управляется vpnctl users и/или tgbot.
+# vpnctl init копирует в state.yaml (пустой до первого подписчика).
+
+approver_chat_id: null    # выставляет бот, когда админ отправляет /start
+last_expiry_sweep_at: 0
+requests: {}              # ожидающие заявки на подписку в Telegram
+users: {}                 # подписчики: vpnctl users add или одобрение в боте

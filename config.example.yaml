@@ -1,0 +1,26 @@
+# Скопируйте в config.yaml (vpnctl init делает это автоматически).
+# Значения xray.* по умолчанию подходят для VLESS+Reality+gRPC; меняйте при необходимости.
+
+bot:
+  server_id: de                 # servers[].id для tgbot (если деплоите); любой id для режима только CLI
+  approver_user_id: 0           # Telegram id админа — нужен только с ботом
+  broadcast_only_approver: true
+  default_subscription_days: 30 # по умолчанию для: vpnctl users add (без --days)
+  # approver_username: admin    # опционально — только для UI бота
+
+xray:
+  port: 443
+  sni: cdn.ozon.ru
+  reality_dest: cdn.ozon.ru:443
+  grpc_service_name: GunService
+  fp_desktop: safari
+  fp_mobile: firefox
+  flow: xtls-rprx-vision
+
+servers:
+  - id: de
+    name: Germany
+    host: 0.0.0.0               # IP вашего VPS
+  - id: es
+    name: Spain
+    host: 0.0.0.0               # IP вашего VPS

@@ -1,0 +1,48 @@
+# === Secrets and runtime data ===
+config.yaml
+secrets.yaml
+state.yaml
+keys/
+backups/
+telemt_socks5.md
+.cursor/
+
+# Env
+.env
+.env.*
+
+# Go build artifacts
+/vpnctl
+/vpnctl.exe
+/vpnctl.exe~
+/tgbot
+/tgbot.exe
+dist/
+*.exe
+
+# Legacy / local clutter
+.ssh-keys/
+__pycache__/
+*.pyc
+.venv/
+bot/
+scripts/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Keep YAML templates
+!config.example.yaml
+!secrets.example.yaml
+!state.example.yaml
