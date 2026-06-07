@@ -1,9 +1,13 @@
 package config
 
+import "strings"
+
 type Config struct {
-	Bot     BotConfig     `yaml:"bot"`
-	Xray    XrayConfig    `yaml:"xray"`
-	Servers []ServerDef   `yaml:"servers"`
+	Bot     BotConfig   `yaml:"bot"`
+	Xray    XrayConfig  `yaml:"xray"`
+	Servers []ServerDef `yaml:"servers"`
+	// SubscriptionTitle is the group name shown in Happ (max 25 chars).
+	SubscriptionTitle string `yaml:"subscription_title,omitempty"`
 }
 
 type BotConfig struct {
@@ -17,6 +21,9 @@ type BotConfig struct {
 type XrayConfig struct {
 	Port            int    `yaml:"port"`
 	SNI             string `yaml:"sni"`
+	// Version pins the xray-core version installed on servers (e.g. "1.8.4").
+	// Empty means install/keep the latest release.
+	Version         string `yaml:"version,omitempty"`
 	RealityDest     string `yaml:"reality_dest"`
 	GRPCServiceName string `yaml:"grpc_service_name"`
 	FPDesktop       string `yaml:"fp_desktop"`
@@ -31,7 +38,14 @@ type ServerDef struct {
 	ID   string `yaml:"id"`
 	Name string `yaml:"name"`
 	Host string `yaml:"host"`
+	// RelayTo, when set to another server id, turns this node into a bridge:
+	// it runs a VLESS+Reality inbound for clients and forwards all traffic to
+	// the referenced exit server via a VLESS outbound (double-VLESS chain).
+	RelayTo string `yaml:"relay_to,omitempty"`
 }
+
+// IsBridge reports whether this node forwards client traffic to an exit.
+func (s ServerDef) IsBridge() bool { return strings.TrimSpace(s.RelayTo) != "" }
 
 type Secrets struct {
 	Telegram TelegramSecrets       `yaml:"telegram"`
@@ -51,8 +65,11 @@ type SSHSecrets struct {
 }
 
 type ServerSecret struct {
-	Password string       `yaml:"password"`
-	Reality  RealityKeys  `yaml:"reality,omitempty"`
+	Password string      `yaml:"password"`
+	Reality  RealityKeys `yaml:"reality,omitempty"`
+	// RelayUUID is the VLESS client id a bridge uses to dial its exit. It must
+	// be present in the exit's clients list. Empty for plain exit servers.
+	RelayUUID string `yaml:"relay_uuid,omitempty"`
 }
 
 type RealityKeys struct {
@@ -93,6 +110,14 @@ func (c *Config) ServerByHost(host string) *ServerDef {
 		}
 	}
 	return nil
+}
+
+// ExitForBridge resolves the exit server a bridge forwards to.
+func (c *Config) ExitForBridge(b *ServerDef) *ServerDef {
+	if b == nil || !b.IsBridge() {
+		return nil
+	}
+	return c.ServerByID(b.RelayTo)
 }
 
 func (c *Config) BotServer() *ServerDef {
@@ -141,6 +166,22 @@ func (s *Secrets) SetReality(serverID string, keys RealityKeys) {
 	}
 	sec := s.Servers[serverID]
 	sec.Reality = keys
+	s.Servers[serverID] = sec
+}
+
+func (s *Secrets) RelayUUID(serverID string) string {
+	if s.Servers == nil {
+		return ""
+	}
+	return s.Servers[serverID].RelayUUID
+}
+
+func (s *Secrets) SetRelayUUID(serverID, uuid string) {
+	if s.Servers == nil {
+		s.Servers = map[string]ServerSecret{}
+	}
+	sec := s.Servers[serverID]
+	sec.RelayUUID = uuid
 	s.Servers[serverID] = sec
 }
 

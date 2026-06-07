@@ -30,6 +30,9 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.Bot.DefaultSubscriptionDays == 0 {
 		cfg.Bot.DefaultSubscriptionDays = 30
 	}
+	if strings.TrimSpace(cfg.SubscriptionTitle) == "" {
+		cfg.SubscriptionTitle = "smknVPN"
+	}
 	return &cfg, nil
 }
 

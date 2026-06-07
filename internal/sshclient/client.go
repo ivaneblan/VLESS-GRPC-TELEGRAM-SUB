@@ -17,7 +17,28 @@ import (
 const defaultUser = "root"
 
 type Client struct {
-	conn *ssh.Client
+	conn     *ssh.Client
+	host     string
+	sec      *config.Secrets
+	serverID string
+}
+
+// Reconnect re-establishes the SSH connection using the original credentials.
+// Useful after an action (e.g. restarting an exit's xray) severs the session
+// because the management traffic itself is routed through that node.
+func (c *Client) Reconnect() error {
+	if c.sec == nil {
+		return fmt.Errorf("reconnect %s: no stored credentials", c.host)
+	}
+	nc, err := Connect(c.host, c.sec, c.serverID)
+	if err != nil {
+		return err
+	}
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
+	c.conn = nc.conn
+	return nil
 }
 
 func Connect(host string, sec *config.Secrets, serverID string) (*Client, error) {
@@ -57,7 +78,7 @@ func Connect(host string, sec *config.Secrets, serverID string) (*Client, error)
 		return nil, fmt.Errorf("ssh handshake %s: %w", host, err)
 	}
 	_ = tcpConn.SetDeadline(time.Time{})
-	return &Client{conn: ssh.NewClient(sshConn, chans, reqs)}, nil
+	return &Client{conn: ssh.NewClient(sshConn, chans, reqs), host: host, sec: sec, serverID: serverID}, nil
 }
 
 // ConnectPassword connects using root password only (used to verify password changes).

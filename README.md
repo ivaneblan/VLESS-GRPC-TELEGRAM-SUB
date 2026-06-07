@@ -50,6 +50,17 @@ make build    # или: go build -o vpnctl ./cmd/vpnctl
 | Новый VPS, сначала очистить старый стек | `vpnctl bootstrap --cleanup` |
 | Переустановка, подписчиков сохранить | `vpnctl redeploy` |
 | Добавить сервер к существующей схеме | правка `config.yaml` → `vpnctl vless newid` → `vpnctl users sync ID` для каждого пользователя |
+| Добавить RU-мост (обход ТСПУ) | в `config.yaml` сервер с `relay_to: <exit_id>` → `vpnctl keys` → `vpnctl vless` → `vpnctl links refresh` |
+
+### Мост / jump-host (обход ТСПУ)
+
+Прямое подключение к иностранному exit на домашнем/мобильном интернете в РФ деградирует: ТСПУ «замораживает» TLS-сессию к иностранному IP. Решение — цепочка через российский узел.
+
+Узел с полем `relay_to: <exit_id>` становится **мостом**: он поднимает обычный VLESS+Reality+gRPC inbound (свои Reality-ключи, те же пользователи), а весь трафик через VLESS-outbound форвардит на указанный exit (двойной VLESS). Клиент подключается к RU-IP (первый хоп — внутри РФ), мост сам ходит к exit.
+
+- Мост даёт **дополнительный** набор ссылок поверх прямых; прямые схемы не меняются.
+- Между мостом и exit используется отдельный `relay_uuid` (хранится в `secrets.yaml`, автоматически регистрируется на exit).
+- Деплой: `vpnctl vless` сначала раскатывает exit'ы, затем мосты (порядок учитывается автоматически).
 
 ## Первичная настройка
 
@@ -174,7 +185,7 @@ systemctl status tg-subscription-bot
 journalctl -u tg-subscription-bot -f
 ```
 
-Функции бота дублируют CLI: одобрение заявок, renew/revoke/sync, трафик и статус. Нужны `telegram.bot_token` и `bot.approver_user_id` в конфиге.
+Функции бота дублируют CLI: одобрение заявок, создание пользователя/подписки (кнопка «➕ Создать пользователя» или `/add_user <user_id> [days|never] [label]`, аналог `vpnctl users add`), renew/revoke/sync, трафик и статус. Нужны `telegram.bot_token` и `bot.approver_user_id` в конфиге.
 
 Локальная разработка (нужен доступ к `api.telegram.org`):
 

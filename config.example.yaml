@@ -1,6 +1,8 @@
 # Скопируйте в config.yaml (vpnctl init делает это автоматически).
 # Значения xray.* по умолчанию подходят для VLESS+Reality+gRPC; меняйте при необходимости.
 
+subscription_title: smknVPN     # имя группы серверов в Happ (#profile-title, до 25 символов)
+
 bot:
   server_id: de                 # servers[].id для tgbot (если деплоите); любой id для режима только CLI
   approver_user_id: 0           # Telegram id админа — нужен только с ботом
@@ -9,6 +11,7 @@ bot:
   # approver_username: admin    # опционально — только для UI бота
 
 xray:
+  # version: 1.8.4              # опционально: закрепить версию xray-core. Пусто = ставить последнюю
   port: 443
   sni: cdn.ozon.ru
   reality_dest: cdn.ozon.ru:443
@@ -20,7 +23,16 @@ xray:
 servers:
   - id: de
     name: Germany
-    host: 0.0.0.0               # IP вашего VPS
+    host: 0.0.0.0               # IP вашего VPS (exit)
   - id: es
     name: Spain
-    host: 0.0.0.0               # IP вашего VPS
+    host: 0.0.0.0               # IP вашего VPS (exit)
+
+  # Мост (jump-host) для обхода ТСПУ: клиент подключается к RU-узлу,
+  # а узел через VLESS форвардит весь трафик на указанный exit (relay_to).
+  # Узел с relay_to получает свои Reality-ключи и принимает тех же пользователей,
+  # давая дополнительный набор ссылок поверх прямых. Раскомментируйте при наличии RU VPS:
+  # - id: ru1
+  #   name: Russia-DE          # понятное имя попадёт в подпись ссылки
+  #   host: 0.0.0.0            # IP российского VPS
+  #   relay_to: de             # id exit-сервера, куда форвардить

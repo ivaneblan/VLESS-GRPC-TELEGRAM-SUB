@@ -3,12 +3,28 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/config"
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/deploy"
 	"github.com/spf13/cobra"
+)
+
+// Populated at build time via -ldflags (see build.ps1).
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
+// Command groups shown in `vpnctl --help`.
+const (
+	groupSetup  = "setup"
+	groupDeploy = "deploy"
+	groupManage = "manage"
+	groupOps    = "ops"
 )
 
 func main() {
@@ -18,78 +34,96 @@ func main() {
 	root := &cobra.Command{
 		Use:   "vpnctl",
 		Short: "VLESS gRPC VPN deploy CLI",
+		Long: `vpnctl deploys and manages a VLESS+gRPC Reality VPN fleet:
+provisions exit servers, manages subscribers, and ships an optional Telegram bot.
+
+Typical first run:
+  vpnctl init                 # create config/secrets templates + SSH keys
+  # edit config.yaml & secrets.yaml
+  vpnctl bootstrap            # fresh install on all servers
+  vpnctl users add alice      # create a subscriber and print links`,
+		Version:           buildVersion(),
+		SilenceErrors:     true,
+		SilenceUsage:      true,
+		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: false},
 	}
-	root.PersistentFlags().StringVar(&paths.Root, "root", paths.Root, "project root directory")
+	root.SetVersionTemplate("vpnctl {{.Version}}\n")
+	root.PersistentFlags().StringVarP(&paths.Root, "root", "C", paths.Root, "project root directory")
+
+	root.AddGroup(
+		&cobra.Group{ID: groupSetup, Title: "Setup & Lifecycle:"},
+		&cobra.Group{ID: groupDeploy, Title: "Deploy & Components:"},
+		&cobra.Group{ID: groupManage, Title: "Subscribers & Servers:"},
+		&cobra.Group{ID: groupOps, Title: "Maintenance & Monitoring:"},
+	)
 
 	root.AddCommand(
-		&cobra.Command{
-			Use:   "init",
-			Short: "Create YAML templates and SSH keys",
-			RunE: func(cmd *cobra.Command, args []string) error {
-				paths = config.DefaultPaths(paths.Root)
-				return deploy.InitProject(paths)
-			},
-		},
-		&cobra.Command{
-			Use:   "keys",
-			Short: "Install SSH public key on all servers",
-			RunE: func(cmd *cobra.Command, args []string) error {
-				paths = config.DefaultPaths(paths.Root)
-				return deploy.Keys(paths)
-			},
-		},
-		&cobra.Command{
-			Use:   "cleanup",
-			Short: "Remove xray, bot, legacy services from all servers",
-			RunE: func(cmd *cobra.Command, args []string) error {
-				paths = config.DefaultPaths(paths.Root)
-				return deploy.Cleanup(paths)
-			},
-		},
-		vlessCmd(&paths),
-		&cobra.Command{
-			Use:   "bot",
-			Short: "Deploy Telegram bot (tgbot) via systemd",
-			RunE: func(cmd *cobra.Command, args []string) error {
-				paths = config.DefaultPaths(paths.Root)
-				return deploy.Bot(paths)
-			},
-		},
-		&cobra.Command{
-			Use:   "check",
-			Short: "Health check all exit servers",
-			RunE: func(cmd *cobra.Command, args []string) error {
-				paths = config.DefaultPaths(paths.Root)
-				return deploy.Health(paths)
-			},
-		},
-		&cobra.Command{
-			Use:   "backup",
-			Short: "Backup state.yaml, config.yaml, secrets.yaml to backups/",
-			RunE: func(cmd *cobra.Command, args []string) error {
-				paths = config.DefaultPaths(paths.Root)
-				return deploy.Backup(paths)
-			},
-		},
+		// Setup & lifecycle
+		simpleCmd(&paths, groupSetup, "init", "Create YAML templates and SSH keys", deploy.InitProject),
+		bootstrapCmd(&paths),
 		allCmd(&paths),
 		redeployCmd(&paths),
-		bootstrapCmd(&paths),
-		passwdCmd(&paths),
+
+		// Deploy & components
+		simpleCmd(&paths, groupDeploy, "keys", "Install SSH public key on all servers", deploy.Keys),
+		vlessCmd(&paths),
+		simpleCmd(&paths, groupDeploy, "bot", "Deploy Telegram bot (tgbot) via systemd", deploy.Bot),
 		linksCmd(&paths),
+
+		// Subscribers & servers
 		usersCmd(&paths),
 		serversCmd(&paths),
+
+		// Maintenance & monitoring
+		checkCmd(&paths),
+		simpleCmd(&paths, groupOps, "backup", "Backup state.yaml, config.yaml, secrets.yaml to backups/", deploy.Backup),
+		simpleCmd(&paths, groupOps, "cleanup", "Remove xray, bot, legacy services from all servers", deploy.Cleanup),
+		passwdCmd(&paths),
 	)
 
 	if err := root.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
+	}
+}
+
+func buildVersion() string {
+	return fmt.Sprintf("%s (commit %s, built %s, %s)", version, commit, date, runtime.Version())
+}
+
+// simpleCmd builds a no-arg command that just reloads paths and runs fn.
+func simpleCmd(paths *config.Paths, group, use, short string, fn func(config.Paths) error) *cobra.Command {
+	return &cobra.Command{
+		Use:     use,
+		Short:   short,
+		GroupID: group,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			*paths = config.DefaultPaths(paths.Root)
+			return fn(*paths)
+		},
+	}
+}
+
+func checkCmd(paths *config.Paths) *cobra.Command {
+	return &cobra.Command{
+		Use:     "check",
+		Aliases: []string{"health"},
+		Short:   "Health check all exit servers",
+		GroupID: groupOps,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			*paths = config.DefaultPaths(paths.Root)
+			return deploy.Health(*paths)
+		},
 	}
 }
 
 func allCmd(paths *config.Paths) *cobra.Command {
 	var skipBot bool
 	c := &cobra.Command{
-		Use:   "all",
-		Short: "keys + vless + links + bot + check",
+		Use:     "all",
+		Short:   "Full deploy: keys + vless + links + bot + check",
+		GroupID: groupSetup,
+		Example: "  vpnctl all\n  vpnctl all --no-bot",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			*paths = config.DefaultPaths(paths.Root)
 			return deploy.All(*paths, false, skipBot)
@@ -102,8 +136,9 @@ func allCmd(paths *config.Paths) *cobra.Command {
 func redeployCmd(paths *config.Paths) *cobra.Command {
 	var skipBot bool
 	c := &cobra.Command{
-		Use:   "redeploy",
-		Short: "backup + cleanup + full deploy",
+		Use:     "redeploy",
+		Short:   "Reinstall with existing subscribers: backup + cleanup + full deploy",
+		GroupID: groupSetup,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			*paths = config.DefaultPaths(paths.Root)
 			return deploy.Redeploy(*paths, false, skipBot)
@@ -120,19 +155,18 @@ func passwdCmd(paths *config.Paths) *cobra.Command {
 		length   int
 	)
 	c := &cobra.Command{
-		Use:   "passwd [server-id...]",
-		Short: "Change root password and update secrets.yaml",
+		Use:     "passwd [server-id...]",
+		Short:   "Change root password and update secrets.yaml",
+		GroupID: groupOps,
 		Long: `Safely rotates root password on VPS nodes.
 
   1. Backs up secrets.yaml
   2. Ensures SSH public key is in authorized_keys (recovery path)
   3. Sets new password on the server
   4. Verifies password login before saving
-  5. Reverts on failure; updates secrets.yaml only after success
-
-Examples:
-  vpnctl passwd --generate          # all servers, random password
-  vpnctl passwd de --password '...' # one server, explicit password`,
+  5. Reverts on failure; updates secrets.yaml only after success`,
+		Example: "  vpnctl passwd --generate          # all servers, random password\n" +
+			"  vpnctl passwd de --password '...' # one server, explicit password",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			*paths = config.DefaultPaths(paths.Root)
 			return deploy.RotateRootPassword(*paths, args, password, generate, length)
@@ -147,8 +181,9 @@ Examples:
 func bootstrapCmd(paths *config.Paths) *cobra.Command {
 	var cleanupFirst, skipBot bool
 	c := &cobra.Command{
-		Use:   "bootstrap",
-		Short: "Fresh install on new servers (empty state, no backup)",
+		Use:     "bootstrap",
+		Short:   "Fresh install on new servers (empty state, no backup)",
+		GroupID: groupSetup,
 		Long: `First-time deploy for new VPS nodes.
 
   1. vpnctl init
@@ -170,8 +205,12 @@ Use redeploy when reinstalling with existing subscribers.`,
 func vlessCmd(paths *config.Paths) *cobra.Command {
 	var newKeys bool
 	c := &cobra.Command{
-		Use:   "vless [server-id...]",
-		Short: "Deploy VLESS+gRPC Reality on servers",
+		Use:     "vless [server-id...]",
+		Short:   "Deploy VLESS+gRPC Reality on servers",
+		GroupID: groupDeploy,
+		Example: "  vpnctl vless              # all servers\n" +
+			"  vpnctl vless de nl        # specific servers\n" +
+			"  vpnctl vless --new-keys   # rotate Reality keys",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			*paths = config.DefaultPaths(paths.Root)
 			return deploy.Vless(*paths, args, newKeys, false)
@@ -182,7 +221,11 @@ func vlessCmd(paths *config.Paths) *cobra.Command {
 }
 
 func linksCmd(paths *config.Paths) *cobra.Command {
-	links := &cobra.Command{Use: "links", Short: "Manage subscription links"}
+	links := &cobra.Command{
+		Use:     "links",
+		Short:   "Manage subscription links",
+		GroupID: groupDeploy,
+	}
 	links.AddCommand(&cobra.Command{
 		Use:   "refresh",
 		Short: "Refresh VLESS links in state.yaml",
@@ -196,17 +239,20 @@ func linksCmd(paths *config.Paths) *cobra.Command {
 
 func usersCmd(paths *config.Paths) *cobra.Command {
 	users := &cobra.Command{
-		Use:   "users",
-		Short: "Manage VPN subscribers (no Telegram required)",
+		Use:     "users",
+		Aliases: []string{"user", "u"},
+		Short:   "Manage VPN subscribers (no Telegram required)",
+		GroupID: groupManage,
 	}
 
 	var addLabel string
 	var addNever bool
 	var addDays int
 	add := &cobra.Command{
-		Use:   "add USER_ID",
-		Short: "Create user, provision on all servers, print links",
-		Args:  cobra.ExactArgs(1),
+		Use:     "add USER_ID",
+		Short:   "Create user, provision on all servers, print links",
+		Args:    cobra.ExactArgs(1),
+		Example: "  vpnctl users add alice\n  vpnctl users add bob --days 30\n  vpnctl users add vip --never",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			*paths = config.DefaultPaths(paths.Root)
 			return deploy.UsersAdd(*paths, args[0], addLabel, addNever, addDays)
@@ -270,8 +316,9 @@ func usersCmd(paths *config.Paths) *cobra.Command {
 
 	users.AddCommand(
 		&cobra.Command{
-			Use:   "list",
-			Short: "List users from state.yaml",
+			Use:     "list",
+			Aliases: []string{"ls"},
+			Short:   "List users from state.yaml",
 			RunE: func(cmd *cobra.Command, args []string) error {
 				*paths = config.DefaultPaths(paths.Root)
 				return deploy.UsersList(*paths)
@@ -281,9 +328,10 @@ func usersCmd(paths *config.Paths) *cobra.Command {
 		show,
 		export,
 		&cobra.Command{
-			Use:   "revoke USER_ID",
-			Short: "Remove user from state and Xray",
-			Args:  cobra.ExactArgs(1),
+			Use:     "revoke USER_ID",
+			Aliases: []string{"rm", "delete"},
+			Short:   "Remove user from state and Xray",
+			Args:    cobra.ExactArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
 				*paths = config.DefaultPaths(paths.Root)
 				return deploy.UsersRevoke(*paths, args[0])
@@ -314,13 +362,16 @@ func usersCmd(paths *config.Paths) *cobra.Command {
 
 func serversCmd(paths *config.Paths) *cobra.Command {
 	servers := &cobra.Command{
-		Use:   "servers",
-		Short: "Inspect configured exit servers",
+		Use:     "servers",
+		Aliases: []string{"server", "srv"},
+		Short:   "Inspect configured exit servers",
+		GroupID: groupManage,
 	}
 	servers.AddCommand(
 		&cobra.Command{
-			Use:   "list",
-			Short: "List servers from config.yaml",
+			Use:     "list",
+			Aliases: []string{"ls"},
+			Short:   "List servers from config.yaml",
 			RunE: func(cmd *cobra.Command, args []string) error {
 				*paths = config.DefaultPaths(paths.Root)
 				return deploy.ServersList(*paths)

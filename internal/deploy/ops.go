@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/config"
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/links"
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/sshclient"
@@ -19,20 +20,56 @@ func Vless(paths config.Paths, serverIDs []string, forceKeys, allowEmptyClients 
 	if err != nil {
 		return err
 	}
-	uuids := config.CollectUUIDs(st)
+	userUUIDs := config.CollectUUIDs(st)
+
 	targets := serverIDs
 	if len(targets) == 0 {
 		for _, s := range cfg.Servers {
 			targets = append(targets, s.ID)
 		}
 	}
+
+	// Ensure every bridge has a relay UUID (its client id on the exit). Done up
+	// front so exit deploys can include it in their client lists.
+	for i := range cfg.Servers {
+		s := cfg.Servers[i]
+		if s.IsBridge() && strings.TrimSpace(sec.RelayUUID(s.ID)) == "" {
+			sec.SetRelayUUID(s.ID, uuid.New().String())
+		}
+	}
+	// Map each exit id -> relay UUIDs of bridges that forward to it.
+	relayByExit := map[string][]string{}
+	for i := range cfg.Servers {
+		s := cfg.Servers[i]
+		if s.IsBridge() {
+			if ru := strings.TrimSpace(sec.RelayUUID(s.ID)); ru != "" {
+				relayByExit[s.RelayTo] = append(relayByExit[s.RelayTo], ru)
+			}
+		}
+	}
+
+	// Deploy exits before bridges: a bridge needs its exit's Reality keys.
+	targets = orderExitsFirst(cfg, targets)
+
 	for i, id := range targets {
 		server := cfg.ServerByID(id)
 		if server == nil {
 			return fmt.Errorf("unknown server id: %s", id)
 		}
-		step(i+1, len(targets), fmt.Sprintf("VLESS on %s (%s @ %s)", server.Name, server.ID, server.Host))
-		logf("%d user UUID(s) from state.yaml", len(uuids))
+		role := "exit"
+		if server.IsBridge() {
+			role = "bridge -> " + server.RelayTo
+		}
+		step(i+1, len(targets), fmt.Sprintf("VLESS on %s (%s @ %s, %s)", server.Name, server.ID, server.Host, role))
+
+		clientUUIDs := userUUIDs
+		if !server.IsBridge() {
+			if extra := relayByExit[server.ID]; len(extra) > 0 {
+				clientUUIDs = append(append([]string{}, userUUIDs...), extra...)
+			}
+		}
+		logf("%d client UUID(s) for this node", len(clientUUIDs))
+
 		connectMsg(server.Host)
 		client, err := sshclient.Connect(server.Host, sec, server.ID)
 		if err != nil {
@@ -50,17 +87,68 @@ func Vless(paths config.Paths, serverIDs []string, forceKeys, allowEmptyClients 
 		} else {
 			logOK("authorized_key added")
 		}
-		result, err := xray.Deploy(client, cfg, sec, server, uuids, forceKeys, allowEmptyClients)
+		result, err := xray.Deploy(client, cfg, sec, server, clientUUIDs, forceKeys, allowEmptyClients)
 		client.Close()
 		if err != nil {
 			return err
 		}
 		logOK("xray status: %s", result.Status)
+
+		// Persist Reality keys / relay UUID now so a later failure in this loop
+		// does not force regeneration on the next run.
+		if err := config.SaveSecrets(paths.SecretsPath, sec); err != nil {
+			return err
+		}
+
+		// Make sure the exit accepts this bridge's relay UUID even when the exit
+		// itself was not part of this deploy run.
+		if server.IsBridge() {
+			if err := registerRelayOnExit(cfg, sec, server); err != nil {
+				return err
+			}
+		}
 	}
 	if err := config.SaveSecrets(paths.SecretsPath, sec); err != nil {
 		return err
 	}
-	logOK("secrets.yaml updated (Reality keys)")
+	logOK("secrets.yaml updated (Reality keys + relay UUIDs)")
+	return nil
+}
+
+// orderExitsFirst returns target ids with exit servers before bridge servers,
+// preserving relative order within each group.
+func orderExitsFirst(cfg *config.Config, ids []string) []string {
+	var exits, bridges []string
+	for _, id := range ids {
+		if s := cfg.ServerByID(id); s != nil && s.IsBridge() {
+			bridges = append(bridges, id)
+		} else {
+			exits = append(exits, id)
+		}
+	}
+	return append(exits, bridges...)
+}
+
+// registerRelayOnExit upserts a bridge's relay UUID into its exit's client list.
+func registerRelayOnExit(cfg *config.Config, sec *config.Secrets, bridge *config.ServerDef) error {
+	exit := cfg.ExitForBridge(bridge)
+	if exit == nil {
+		return fmt.Errorf("bridge %s: relay_to %q not found", bridge.ID, bridge.RelayTo)
+	}
+	relayUUID := strings.TrimSpace(sec.RelayUUID(bridge.ID))
+	if relayUUID == "" {
+		return fmt.Errorf("bridge %s: missing relay UUID", bridge.ID)
+	}
+	logf("register relay UUID on exit %s (%s)", exit.ID, exit.Host)
+	client, err := sshclient.Connect(exit.Host, sec, exit.ID)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	if err := xray.UpsertClient(client, relayUUID, cfg.Xray.Flow); err != nil {
+		return err
+	}
+	logOK("relay UUID active on exit %s", exit.ID)
 	return nil
 }
 

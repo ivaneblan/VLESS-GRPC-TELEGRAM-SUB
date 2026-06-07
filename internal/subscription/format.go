@@ -10,18 +10,53 @@ import (
 )
 
 func (m *Manager) BuildSubscriptionMessage(serverLinks map[string]map[string]string, expiresAt *int64) string {
-	lines := []string{"smknVpn server list:\n"}
+	title := strings.TrimSpace(m.Cfg.SubscriptionTitle)
+	if title == "" {
+		title = "smknVPN"
+	}
+	lines := []string{"smknVpn — ваша подписка:\n"}
 	if expiresAt != nil && *expiresAt > 0 {
-		lines = append(lines, fmt.Sprintf("Subscription valid until: %s", m.FormatTS(*expiresAt)))
+		lines = append(lines, fmt.Sprintf("Подписка действует до: %s", m.FormatTS(*expiresAt)))
 		lines = append(lines, "")
 	}
-	links := m.DefaultLinks(serverLinks)
-	if len(links) > 0 {
-		lines = append(lines, "VLESS Reality (gRPC):")
-		lines = append(lines, "```\n"+strings.Join(links, "\n")+"\n```")
+
+	// One combined subscription body: bridges first (обход ТСПУ через РФ —
+	// рекомендуется для домашнего интернета), затем прямые exit-серверы.
+	var bridges, exits []config.ServerDef
+	for _, s := range m.Cfg.Servers {
+		if s.IsBridge() {
+			bridges = append(bridges, s)
+		} else {
+			exits = append(exits, s)
+		}
+	}
+	ordered := append(append([]config.ServerDef{}, bridges...), exits...)
+
+	var body []string
+	for _, s := range ordered {
+		hostLinks := serverLinks[s.Host]
+		if hostLinks == nil {
+			continue
+		}
+		if link := hostLinks["default"]; link != "" {
+			body = append(body, link)
+		}
+	}
+	if len(body) == 0 {
+		// Fallback: state built before servers were known.
+		body = m.DefaultLinks(serverLinks)
+	}
+
+	if len(body) > 0 {
+		// Happ subscription body: a `#profile-title` header groups the links
+		// under one named subscription on import from clipboard.
+		block := "#profile-title: " + title + "\n" + strings.Join(body, "\n")
+		lines = append(lines, "Все серверы одной подпиской (Happ):")
+		lines = append(lines, "```\n"+block+"\n```")
 		lines = append(lines, "")
 	}
-	lines = append(lines, "В Happ: Add profile -> Import from clipboard/URL.")
+
+	lines = append(lines, fmt.Sprintf("В Happ: Add profile -> Import from clipboard/URL. Серверы появятся группой «%s».", title))
 	return strings.Join(lines, "\n")
 }
 

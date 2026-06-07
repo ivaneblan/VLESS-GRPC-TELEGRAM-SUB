@@ -15,6 +15,7 @@ const (
 	btnSubscribe = "📨 Запросить подписку"
 	btnAdmin     = "🛠 Админ-панель"
 	btnGet       = "🔑 Подписка (/get)"
+	btnCreate    = "➕ Создать пользователя"
 	btnPending   = "📥 Заявки"
 	btnUsers     = "👥 Пользователи"
 	btnServers   = "🖥 Серверы"
@@ -32,6 +33,7 @@ const (
 func AdminMenuKeyboard() *models.InlineKeyboardMarkup {
 	return &models.InlineKeyboardMarkup{InlineKeyboard: [][]models.InlineKeyboardButton{
 		{{Text: btnGet, CallbackData: "cmd:get"}},
+		{{Text: btnCreate, CallbackData: "cmd:create"}},
 		{
 			{Text: btnPending, CallbackData: "cmd:pending"},
 			{Text: btnHealth, CallbackData: "cmd:health"},

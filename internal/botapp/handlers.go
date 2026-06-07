@@ -130,6 +130,8 @@ func (a *App) handleCommand(ctx context.Context, b *bot.Bot, update *models.Upda
 		a.cmdSubscribe(ctx, b, update)
 	case "/get":
 		a.cmdGet(ctx, b, update)
+	case "/add_user":
+		a.cmdAddUser(ctx, b, update)
 	case "/pending":
 		a.cmdPending(ctx, b, update)
 	case "/users":
@@ -267,6 +269,20 @@ func (a *App) cmdGet(ctx context.Context, b *bot.Bot, update *models.Update) {
 	st.Users[userKey] = entry
 	_ = a.svc.SaveState(st)
 	a.replyMD(ctx, b, msg, a.svc.BuildHappCodeMessage(links, a.svc.ExpiresAtInt(&entry)), nil)
+}
+
+func (a *App) cmdAddUser(ctx context.Context, b *bot.Bot, update *models.Update) {
+	msg := update.Message
+	if !a.IsApprover(msg.From.ID) {
+		a.reply(ctx, b, msg, "Команда только для подтверждающего пользователя.", nil)
+		return
+	}
+	args := strings.Fields(msg.Text)
+	if len(args) < 2 {
+		a.reply(ctx, b, msg, "Использование: /add_user <user_id> [days|never] [label]", nil)
+		return
+	}
+	a.createUserByInput(ctx, b, msg, strings.Join(args[1:], " "))
 }
 
 func (a *App) cmdPending(ctx context.Context, b *bot.Bot, update *models.Update) {
@@ -438,6 +454,13 @@ func (a *App) handleText(ctx context.Context, b *bot.Bot, update *models.Update)
 		action := a.pendingAction[msg.From.ID]
 		a.pendingMu.RUnlock()
 		if action != "" {
+			if action == "create_user" {
+				a.pendingMu.Lock()
+				delete(a.pendingAction, msg.From.ID)
+				a.pendingMu.Unlock()
+				a.createUserByInput(ctx, b, msg, text)
+				return
+			}
 			if !isDigits(text) {
 				a.reply(ctx, b, msg, "Ожидаю числовой user_id.", nil)
 				return
@@ -633,6 +656,11 @@ func (a *App) onAction(ctx context.Context, b *bot.Bot, update *models.Update) {
 		st.Users[userKey] = entry
 		_ = a.svc.SaveState(st)
 		a.replyMD(ctx, b, msg, a.svc.BuildHappCodeMessage(links, a.svc.ExpiresAtInt(&entry)), AdminMenuKeyboard())
+	case "create":
+		a.pendingMu.Lock()
+		a.pendingAction[q.From.ID] = "create_user"
+		a.pendingMu.Unlock()
+		a.reply(ctx, b, msg, "Отправь данные нового пользователя одной строкой:\n<user_id> [days|never] [label]\n\nПримеры:\n123456789\n123456789 30\n123456789 never my-label", nil)
 	case "admin":
 		a.reply(ctx, b, msg, "Панель управления:", AdminMenuKeyboard())
 	case "pending":
@@ -953,6 +981,63 @@ func (a *App) neverExpiresByID(ctx context.Context, b *bot.Bot, msg *models.Mess
 		status = "включена"
 	}
 	a.reply(ctx, b, msg, fmt.Sprintf("Бессрочная подписка для %s %s.", targetUserID, status), AdminMenuKeyboard())
+}
+
+func (a *App) createUserByInput(ctx context.Context, b *bot.Bot, msg *models.Message, input string) {
+	fields := strings.Fields(input)
+	if len(fields) == 0 {
+		a.reply(ctx, b, msg, "Использование: <user_id> [days|never] [label]", nil)
+		return
+	}
+	userID := fields[0]
+	if !isDigits(userID) {
+		a.reply(ctx, b, msg, "user_id должен быть числом.", nil)
+		return
+	}
+	var (
+		never bool
+		days  int
+	)
+	rest := fields[1:]
+	if len(rest) > 0 {
+		switch strings.ToLower(rest[0]) {
+		case "never", "∞", "♾":
+			never = true
+			rest = rest[1:]
+		default:
+			if n, err := strconv.Atoi(rest[0]); err == nil && n > 0 {
+				days = n
+				rest = rest[1:]
+			}
+		}
+	}
+	label := strings.Join(rest, " ")
+	a.createUser(ctx, b, msg, userID, label, never, days)
+}
+
+func (a *App) createUser(ctx context.Context, b *bot.Bot, msg *models.Message, userID, label string, never bool, days int) {
+	links, err := a.svc.AddUser(userID, label, never, days)
+	if err != nil {
+		a.reply(ctx, b, msg, "Ошибка создания пользователя: "+err.Error(), nil)
+		return
+	}
+	st, err := a.svc.LoadState()
+	if err != nil {
+		a.reply(ctx, b, msg, "Пользователь создан, но не удалось прочитать state: "+err.Error(), nil)
+		return
+	}
+	entry := st.Users[userID]
+	expiry := a.svc.ExpiresAtInt(&entry)
+	var expiresView string
+	if entry.NeverExpires {
+		expiresView = "бессрочно"
+	} else if expiry != nil && *expiry > 0 {
+		expiresView = a.svc.FormatTS(*expiry)
+	} else {
+		expiresView = "n/a"
+	}
+	head := fmt.Sprintf("Пользователь %s создан. Истекает: %s\n\n", userID, expiresView)
+	a.sendMD(ctx, b, msg.Chat.ID, head+a.svc.BuildHappCodeMessage(links, expiry), AdminMenuKeyboard())
 }
 
 func (a *App) editCallbackText(ctx context.Context, b *bot.Bot, q *models.CallbackQuery, text string) {

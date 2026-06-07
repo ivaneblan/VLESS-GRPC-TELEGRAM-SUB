@@ -38,11 +38,24 @@ func BuildServerLinks(p ServerParams, uuid string) map[string]string {
 	}
 }
 
+// ParamsFromConfig builds link parameters for a server. A bridge node
+// (relay_to set) terminates the client's Reality session locally, so it uses
+// its own Reality keys and host exactly like an exit; only the display label is
+// annotated with the downstream exit for clarity.
 func ParamsFromConfig(cfg *config.Config, sec *config.Secrets, server *config.ServerDef) (ServerParams, error) {
 	x := cfg.Xray.WithDefaults()
 	reality := sec.Reality(server.ID)
 	if reality.PublicKey == "" || reality.ShortID == "" {
 		return ServerParams{}, fmt.Errorf("missing reality keys for %s", server.ID)
+	}
+	displayName := server.Name
+	if server.IsBridge() {
+		if displayName == "" {
+			displayName = server.Host
+		}
+		if exit := cfg.ExitForBridge(server); exit != nil && exit.Name != "" {
+			displayName = fmt.Sprintf("%s via %s", exit.Name, server.Name)
+		}
 	}
 	return ServerParams{
 		Host:        server.Host,
@@ -51,7 +64,7 @@ func ParamsFromConfig(cfg *config.Config, sec *config.Secrets, server *config.Se
 		Flow:        x.Flow,
 		PBK:         reality.PublicKey,
 		SID:         reality.ShortID,
-		DisplayName: server.Name,
+		DisplayName: displayName,
 		GRPCService: x.GRPCServiceName,
 		XHTTPPort:   x.XHTTPPort,
 		XHTTPPath:   x.XHTTPPath,

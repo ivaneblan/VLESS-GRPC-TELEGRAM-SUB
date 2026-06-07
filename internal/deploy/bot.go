@@ -107,10 +107,15 @@ func ensureBotBinary(paths config.Paths) error {
 
 func uploadBotBundle(client *sshclient.Client, paths config.Paths) error {
 	localBin := filepath.Join(paths.Root, filepath.FromSlash(localBotLinux))
-	if err := sshclient.UploadFile(client, localBin, remoteBotBin); err != nil {
+	// Upload to a temp path and atomically replace: overwriting the binary in
+	// place fails with ETXTBSY while the old bot process is still running.
+	tmpBin := remoteBotBin + ".new"
+	if err := sshclient.UploadFile(client, localBin, tmpBin); err != nil {
 		return err
 	}
-	_, _, _ = client.Run("chmod +x "+remoteBotBin, 15*time.Second)
+	if rc, out, errStr := client.Run(fmt.Sprintf("chmod +x %s && mv -f %s %s", tmpBin, tmpBin, remoteBotBin), 15*time.Second); rc != 0 {
+		return fmt.Errorf("install bot binary: %s %s", out, errStr)
+	}
 	logf("uploaded %s", localBotLinux)
 
 	cfgData, err := os.ReadFile(paths.ConfigPath)

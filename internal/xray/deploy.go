@@ -22,6 +22,13 @@ type DeployResult struct {
 
 func Deploy(client *sshclient.Client, cfg *config.Config, sec *config.Secrets, server *config.ServerDef, uuids []string, forceKeys, allowEmptyClients bool) (*DeployResult, error) {
 	x := cfg.Xray.WithDefaults()
+
+	// xray must exist before we can run `xray x25519` / `xray uuid` below.
+	freshInstall, err := ensureInstalled(client, x.Version)
+	if err != nil {
+		return nil, err
+	}
+
 	keys := sec.Reality(server.ID)
 	if forceKeys || keys.PublicKey == "" || keys.PrivateKey == "" || keys.ShortID == "" {
 		fmt.Println("  · generating Reality keys (xray x25519)...")
@@ -33,10 +40,6 @@ func Deploy(client *sshclient.Client, cfg *config.Config, sec *config.Secrets, s
 		fmt.Println("  ✓ new Reality keys generated")
 	} else {
 		fmt.Printf("  · reusing Reality keys for %s\n", server.ID)
-	}
-
-	if err := ensureInstalled(client); err != nil {
-		return nil, err
 	}
 
 	if len(uuids) == 0 {
@@ -53,7 +56,34 @@ func Deploy(client *sshclient.Client, cfg *config.Config, sec *config.Secrets, s
 	}
 
 	fmt.Printf("  · writing xray config (%d client UUIDs)...\n", len(uuids))
-	xrayCfg := buildConfig(uuids, x, keys.PrivateKey, keys.ShortID)
+	var xrayCfg map[string]interface{}
+	if server.IsBridge() {
+		exit := cfg.ExitForBridge(server)
+		if exit == nil {
+			return nil, fmt.Errorf("bridge %s: relay_to %q not found in servers", server.ID, server.RelayTo)
+		}
+		if exit.IsBridge() {
+			return nil, fmt.Errorf("bridge %s cannot relay to another bridge (%s)", server.ID, exit.ID)
+		}
+		exitKeys := sec.Reality(exit.ID)
+		if exitKeys.PublicKey == "" || exitKeys.ShortID == "" {
+			return nil, fmt.Errorf("exit %s has no Reality keys yet — deploy it first (vpnctl vless %s)", exit.ID, exit.ID)
+		}
+		relayUUID := strings.TrimSpace(sec.RelayUUID(server.ID))
+		if relayUUID == "" {
+			fmt.Println("  · generating relay UUID (bridge -> exit)...")
+			id, err := genUUID(client)
+			if err != nil {
+				return nil, err
+			}
+			relayUUID = id
+			sec.SetRelayUUID(server.ID, relayUUID)
+		}
+		fmt.Printf("  · bridge mode: forwarding to exit %s (%s:%d) via VLESS\n", exit.ID, exit.Host, x.Port)
+		xrayCfg = buildRelayConfig(uuids, x, keys.PrivateKey, keys.ShortID, exit.Host, x.Port, exitKeys.PublicKey, exitKeys.ShortID, relayUUID)
+	} else {
+		xrayCfg = buildConfig(uuids, x, keys.PrivateKey, keys.ShortID)
+	}
 	changed, err := applyConfig(client, xrayCfg)
 	if err != nil {
 		return nil, err
@@ -64,11 +94,14 @@ func Deploy(client *sshclient.Client, cfg *config.Config, sec *config.Secrets, s
 	_, _, _ = client.Run("systemctl daemon-reload", 30*time.Second)
 	_, _, _ = client.Run("systemctl enable xray", 30*time.Second)
 
-	if changed {
-		fmt.Println("  · restarting xray (config changed)...")
-		rc, out, errStr := client.Run("systemctl restart xray", 60*time.Second)
-		if rc != 0 {
-			return nil, fmt.Errorf("xray restart: %s %s", out, errStr)
+	if changed || freshInstall {
+		if freshInstall {
+			fmt.Println("  · restarting xray (fresh install)...")
+		} else {
+			fmt.Println("  · restarting xray (config changed)...")
+		}
+		if err := restartXray(client); err != nil {
+			return nil, err
 		}
 		fmt.Println("  ✓ xray config updated and restarted")
 	} else {
@@ -76,9 +109,8 @@ func Deploy(client *sshclient.Client, cfg *config.Config, sec *config.Secrets, s
 		_, out, _ := client.Run("systemctl is-active xray", 15*time.Second)
 		if strings.TrimSpace(out) != "active" {
 			fmt.Println("  · xray not active — restarting...")
-			rc, out, errStr := client.Run("systemctl restart xray", 60*time.Second)
-			if rc != 0 {
-				return nil, fmt.Errorf("xray restart: %s %s", out, errStr)
+			if err := restartXray(client); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -98,24 +130,78 @@ func Deploy(client *sshclient.Client, cfg *config.Config, sec *config.Secrets, s
 	}, nil
 }
 
-func ensureInstalled(client *sshclient.Client) error {
-	rc, out, _ := client.Run("command -v xray >/dev/null 2>&1 && xray version | head -1 || echo missing", 30*time.Second)
-	if !strings.Contains(out, "missing") && strings.TrimSpace(out) != "" {
-		fmt.Printf("  ✓ xray already installed: %s\n", strings.Split(strings.TrimSpace(out), "\n")[0])
+// restartXray restarts the service and confirms it is active. Some hosts close
+// the SSH exec channel during a service restart without sending an exit status
+// (golang ssh returns ExitMissingError / non-zero rc), even though the restart
+// succeeded; we therefore verify via `systemctl is-active` before failing.
+func restartXray(client *sshclient.Client) error {
+	rc, out, errStr := client.Run("systemctl restart xray", 60*time.Second)
+	if rc == 0 {
 		return nil
 	}
-	fmt.Println("  · installing xray (live output, 2–5 min)...")
-	installScript := `set -e
+	// The restart frequently drops our own SSH session when we are managing an
+	// exit whose VPN carries this very connection. Reconnect, then verify.
+	for i := 0; i < 5; i++ {
+		time.Sleep(3 * time.Second)
+		if err := client.Reconnect(); err != nil {
+			continue
+		}
+		if _, active, _ := client.Run("systemctl is-active xray", 15*time.Second); strings.TrimSpace(active) == "active" {
+			return nil
+		}
+	}
+	return fmt.Errorf("restart xray: %s %s", out, errStr)
+}
+
+// ensureInstalled installs xray if missing. It returns true when a fresh
+// install was performed (the service then runs the installer's default config,
+// so the caller must restart after writing the real config).
+//
+// version pins the xray-core release to install. When empty, the latest
+// release is installed and an already-installed xray is left untouched. When
+// set, xray is installed/reinstalled to that exact version unless it already
+// matches the installed one.
+func ensureInstalled(client *sshclient.Client, version string) (bool, error) {
+	version = strings.TrimSpace(version)
+	rc, out, _ := client.Run("command -v xray >/dev/null 2>&1 && xray version | head -1 || echo missing", 30*time.Second)
+	installed := !strings.Contains(out, "missing") && strings.TrimSpace(out) != ""
+	if installed {
+		current := strings.Split(strings.TrimSpace(out), "\n")[0]
+		if version == "" || strings.Contains(current, version) {
+			fmt.Printf("  ✓ xray already installed: %s\n", current)
+			return false, nil
+		}
+		fmt.Printf("  · xray %s installed, switching to pinned %s...\n", current, version)
+	}
+
+	versionArg := ""
+	if version != "" {
+		versionArg = " --version " + version
+		fmt.Printf("  · installing xray %s (live output, 2–5 min)...\n", version)
+	} else {
+		fmt.Println("  · installing xray latest (live output, 2–5 min)...")
+	}
+	installScript := fmt.Sprintf(`set -e
+echo "[xray] preparing dependencies (unzip, curl)..."
+export DEBIAN_FRONTEND=noninteractive
+if command -v apt-get >/dev/null 2>&1; then
+  apt-get update -y || true
+  apt-get install -y unzip curl ca-certificates || true
+elif command -v dnf >/dev/null 2>&1; then
+  dnf install -y unzip curl ca-certificates || true
+elif command -v yum >/dev/null 2>&1; then
+  yum install -y unzip curl ca-certificates || true
+fi
 echo "[xray] downloading install script..."
-bash <(curl -fsSL https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh) install
+bash <(curl -fsSL https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh) install%s
 echo "[xray] install finished"
-`
+`, versionArg)
 	rc, out, errStr := client.RunScriptLive(installScript, 300*time.Second)
 	if rc != 0 {
-		return fmt.Errorf("xray install failed: %s %s", out, errStr)
+		return false, fmt.Errorf("xray install failed: %s %s", out, errStr)
 	}
 	fmt.Println("  ✓ xray installed")
-	return nil
+	return true, nil
 }
 
 var (
@@ -201,10 +287,96 @@ func buildConfig(uuids []string, x config.XrayConfig, privateKey, shortID string
 	}
 }
 
+// buildRelayConfig builds the xray config for a bridge node: a normal
+// VLESS+Reality+gRPC inbound (its own keys, the same client UUIDs) plus a VLESS
+// outbound that dials the exit over gRPC+Reality using relayUUID. The relay
+// outbound is listed first, so all client traffic is forwarded to the exit.
+func buildRelayConfig(uuids []string, x config.XrayConfig, privateKey, shortID, exitHost string, exitPort int, exitPublicKey, exitShortID, relayUUID string) map[string]interface{} {
+	clients := make([]map[string]string, 0, len(uuids))
+	for _, id := range uuids {
+		clients = append(clients, map[string]string{"id": id})
+	}
+	return map[string]interface{}{
+		"log": map[string]string{"loglevel": "warning"},
+		"inbounds": []map[string]interface{}{
+			{
+				"tag":      "vless-grpc-reality",
+				"listen":   "0.0.0.0",
+				"port":     x.Port,
+				"protocol": "vless",
+				"settings": map[string]interface{}{
+					"clients":    clients,
+					"decryption": "none",
+				},
+				"streamSettings": map[string]interface{}{
+					"network":  "grpc",
+					"security": "reality",
+					"grpcSettings": map[string]string{
+						"serviceName": x.GRPCServiceName,
+					},
+					"realitySettings": map[string]interface{}{
+						"show":        false,
+						"dest":        x.RealityDest,
+						"xver":        0,
+						"serverNames": []string{x.SNI},
+						"privateKey":  privateKey,
+						"shortIds":    []string{shortID},
+					},
+				},
+				"sniffing": map[string]interface{}{
+					"enabled":      true,
+					"destOverride": []string{"http", "tls", "quic"},
+				},
+			},
+		},
+		"outbounds": []map[string]interface{}{
+			{
+				"protocol": "vless",
+				"tag":      "relay",
+				"settings": map[string]interface{}{
+					"vnext": []map[string]interface{}{
+						{
+							"address": exitHost,
+							"port":    exitPort,
+							"users": []map[string]interface{}{
+								{"id": relayUUID, "encryption": "none"},
+							},
+						},
+					},
+				},
+				"streamSettings": map[string]interface{}{
+					"network":  "grpc",
+					"security": "reality",
+					"grpcSettings": map[string]string{
+						"serviceName": x.GRPCServiceName,
+					},
+					"realitySettings": map[string]interface{}{
+						"serverName":  x.SNI,
+						"publicKey":   exitPublicKey,
+						"shortId":     exitShortID,
+						"fingerprint": x.FPDesktop,
+					},
+				},
+			},
+			{"protocol": "freedom", "tag": "direct"},
+			{"protocol": "blackhole", "tag": "blocked"},
+		},
+	}
+}
+
 func applyConfig(client *sshclient.Client, cfg map[string]interface{}) (bool, error) {
 	raw, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return false, err
+	}
+	// Detect change against the CURRENT remote config before overwriting it.
+	changed := true
+	_, existing, _ := client.Run(fmt.Sprintf("test -f %s && cat %s || echo", ConfigPath, ConfigPath), 30*time.Second)
+	if strings.TrimSpace(existing) != "" {
+		var remote map[string]interface{}
+		if json.Unmarshal([]byte(existing), &remote) == nil {
+			changed = !jsonEqual(remote, cfg)
+		}
 	}
 	hex := fmt.Sprintf("%x", raw)
 	writePy := fmt.Sprintf(
@@ -215,15 +387,7 @@ func applyConfig(client *sshclient.Client, cfg map[string]interface{}) (bool, er
 	if rc != 0 {
 		return false, fmt.Errorf("write config: %s %s", out, errStr)
 	}
-	rc, remoteOut, _ := client.Run(fmt.Sprintf("test -f %s && cat %s || echo", ConfigPath, ConfigPath), 30*time.Second)
-	if rc != 0 || strings.TrimSpace(remoteOut) == "" {
-		return true, nil
-	}
-	var remote map[string]interface{}
-	if json.Unmarshal([]byte(remoteOut), &remote) != nil {
-		return true, nil
-	}
-	return !jsonEqual(remote, cfg), nil
+	return changed, nil
 }
 
 func jsonEqual(a, b map[string]interface{}) bool {
@@ -267,11 +431,7 @@ func UpsertClient(client *sshclient.Client, uuid string, flow string) error {
 	if err != nil {
 		return err
 	}
-	rc, out, errStr = client.Run("systemctl restart xray", 60*time.Second)
-	if rc != 0 {
-		return fmt.Errorf("restart xray: %s %s", out, errStr)
-	}
-	return nil
+	return restartXray(client)
 }
 
 func RemoveClient(client *sshclient.Client, uuid string) (bool, error) {
@@ -310,9 +470,8 @@ func RemoveClient(client *sshclient.Client, uuid string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	rc, out, errStr = client.Run("systemctl restart xray", 60*time.Second)
-	if rc != 0 {
-		return false, fmt.Errorf("restart: %s %s", out, errStr)
+	if err := restartXray(client); err != nil {
+		return false, err
 	}
 	return true, nil
 }
