@@ -154,7 +154,7 @@ func (a *App) FormatHealthMessage() (string, error) {
 	}
 	pending := 0
 	for _, req := range st.Requests {
-		if RequestStatus(req) == "pending" {
+		if req.Status == "pending" {
 			pending++
 		}
 	}
@@ -166,7 +166,6 @@ func (a *App) FormatHealthMessage() (string, error) {
 			expired++
 		}
 	}
-	_ = a.svc.SaveState(st)
 	return fmt.Sprintf(
 		"Сводка:\n- серверов: %d\n- пользователей: %d\n- заявок pending: %d\n- просроченных подписок: %d",
 		len(a.cfg.Servers), len(st.Users), pending, expired,
@@ -225,7 +224,6 @@ func (a *App) FormatUsersMessage() (string, error) {
 			r.id, label, clientUUID, expiresView, serversView,
 		))
 	}
-	_ = a.svc.SaveState(st)
 	return strings.Join(lines, "\n"), nil
 }
 
@@ -259,15 +257,14 @@ func (a *App) FormatTrafficMessage() string {
 	return strings.Join(lines, "\n")
 }
 
-func pendingRequests(st *config.State) []Request {
-	var out []Request
-	for id, raw := range st.Requests {
-		if RequestStatus(raw) != "pending" {
+func pendingRequests(st *config.State) []config.Request {
+	var out []config.Request
+	for id, req := range st.Requests {
+		if req.Status != "pending" {
 			continue
 		}
-		req, err := ParseRequest(id, raw)
-		if err != nil {
-			continue
+		if req.RequestID == "" {
+			req.RequestID = id
 		}
 		out = append(out, req)
 	}

@@ -205,7 +205,7 @@ func (a *App) createSubscriptionRequest(ctx context.Context, b *bot.Bot, msg *mo
 	}
 	now := time.Now().Unix()
 	requestID := fmt.Sprintf("%d-%d", user.ID, now)
-	req := Request{
+	req := config.Request{
 		RequestID: requestID,
 		UserID:    user.ID,
 		Username:  user.Username,
@@ -214,11 +214,14 @@ func (a *App) createSubscriptionRequest(ctx context.Context, b *bot.Bot, msg *mo
 		CreatedAt: now,
 	}
 	var approverChatID *int64
-	_ = a.svc.WithState(func(st *config.State) error {
-		st.Requests[requestID] = req.ToMap()
+	if err := a.svc.WithState(func(st *config.State) error {
+		st.Requests[requestID] = req
 		approverChatID = st.ApproverChatID
 		return nil
-	})
+	}); err != nil {
+		a.reply(ctx, b, msg, "Не удалось сохранить заявку: "+err.Error(), nil)
+		return
+	}
 	if approverChatID == nil {
 		a.reply(ctx, b, msg, fmt.Sprintf(
 			"Заявка создана, но %s еще не открыл чат с ботом.\nПопроси %s написать боту /start.",
@@ -244,30 +247,35 @@ func (a *App) cmdGet(ctx context.Context, b *bot.Bot, update *models.Update) {
 		a.reply(ctx, b, msg, "Команда /get доступна только подтверждающему пользователю.", nil)
 		return
 	}
-	st, err := a.svc.LoadState()
-	if err != nil {
-		a.reply(ctx, b, msg, "Ошибка state: "+err.Error(), nil)
-		return
-	}
-	a.svc.SweepExpiredUsers(st, 0)
 	label := msg.From.Username
 	if label == "" {
 		label = "approver"
 	}
-	links, err := a.svc.GetOrCreateUserLink(st, strconv.FormatInt(msg.From.ID, 10), label+"-happ")
-	if err != nil {
+	userKey := strconv.FormatInt(msg.From.ID, 10)
+	var (
+		links map[string]map[string]string
+		entry config.UserEntry
+	)
+	if err := a.svc.WithState(func(st *config.State) error {
+		a.svc.SweepExpiredUsers(st, 0)
+		lm, err := a.svc.GetOrCreateUserLink(st, userKey, label+"-happ")
+		if err != nil {
+			return err
+		}
+		links = lm
+		e := st.Users[userKey]
+		if a.IsApprover(msg.From.ID) {
+			e.NeverExpires = true
+			e.ExpiresAt = nil
+		}
+		a.svc.EnsureUserExpiry(&e)
+		st.Users[userKey] = e
+		entry = e
+		return nil
+	}); err != nil {
 		a.reply(ctx, b, msg, "Ошибка: "+err.Error(), nil)
 		return
 	}
-	userKey := strconv.FormatInt(msg.From.ID, 10)
-	entry := st.Users[userKey]
-	if a.IsApprover(msg.From.ID) {
-		entry.NeverExpires = true
-		entry.ExpiresAt = nil
-	}
-	a.svc.EnsureUserExpiry(&entry)
-	st.Users[userKey] = entry
-	_ = a.svc.SaveState(st)
 	a.replyMD(ctx, b, msg, a.svc.BuildHappCodeMessage(links, a.svc.ExpiresAtInt(&entry)), nil)
 }
 
@@ -524,52 +532,80 @@ func (a *App) onDecision(ctx context.Context, b *bot.Bot, update *models.Update)
 	}
 	action, requestID := parts[0], parts[1]
 
-	st, err := a.svc.LoadState()
-	if err != nil {
-		return
-	}
-	a.svc.SweepExpiredUsers(st, 0)
-	raw, ok := st.Requests[requestID]
-	if !ok {
+	var (
+		outcome string // notfound | processed | approved | rejected
+		errMsg  string
+		links   map[string]map[string]string
+		entry   config.UserEntry
+		req     config.Request
+	)
+	werr := a.svc.WithState(func(st *config.State) error {
+		a.svc.SweepExpiredUsers(st, 0)
+		r, ok := st.Requests[requestID]
+		if !ok {
+			outcome = "notfound"
+			return nil
+		}
+		if r.Status != "pending" {
+			outcome = "processed"
+			return nil
+		}
+		r.RequestID = requestID
+		req = r
+		if action == "approve" {
+			labelBase := req.Username
+			if labelBase == "" {
+				labelBase = fmt.Sprintf("user-%d", req.UserID)
+			}
+			userKey := strconv.FormatInt(req.UserID, 10)
+			lm, err := a.svc.GetOrCreateUserLink(st, userKey, labelBase+"-happ")
+			if err != nil {
+				// Return the error so WithState rolls back: the request stays
+				// pending and no partial state is written.
+				errMsg = err.Error()
+				return err
+			}
+			links = lm
+			e := st.Users[userKey]
+			if a.cfg.Bot.ApproverUserID != 0 && req.UserID == a.cfg.Bot.ApproverUserID {
+				e.NeverExpires = true
+				e.ExpiresAt = nil
+			}
+			a.svc.EnsureUserExpiry(&e)
+			st.Users[userKey] = e
+			entry = e
+			r.Status = "approved"
+			st.Requests[requestID] = r
+			outcome = "approved"
+			return nil
+		}
+		r.Status = "rejected"
+		st.Requests[requestID] = r
+		outcome = "rejected"
+		return nil
+	})
+
+	switch outcome {
+	case "notfound":
 		a.editCallbackText(ctx, b, q, "Заявка не найдена.")
 		return
-	}
-	if RequestStatus(raw) != "pending" {
+	case "processed":
 		a.editCallbackText(ctx, b, q, "Эта заявка уже обработана.")
 		return
 	}
+	if errMsg != "" {
+		a.editCallbackText(ctx, b, q, "Ошибка выдачи подписки: "+errMsg)
+		return
+	}
+	if werr != nil {
+		a.editCallbackText(ctx, b, q, "Ошибка сохранения состояния: "+werr.Error())
+		return
+	}
 
-	if action == "approve" {
-		req, _ := ParseRequest(requestID, raw)
-		m, _ := raw.(map[string]interface{})
-		m["status"] = "approved"
-		st.Requests[requestID] = m
-
-		labelBase := req.Username
-		if labelBase == "" {
-			labelBase = fmt.Sprintf("user-%d", req.UserID)
-		}
-		links, err := a.svc.GetOrCreateUserLink(st, strconv.FormatInt(req.UserID, 10), labelBase+"-happ")
-		if err != nil {
-			m["status"] = "pending"
-			st.Requests[requestID] = m
-			_ = a.svc.SaveState(st)
-			a.editCallbackText(ctx, b, q, "Ошибка выдачи подписки: "+err.Error())
-			return
-		}
-		userKey := strconv.FormatInt(req.UserID, 10)
-		entry := st.Users[userKey]
-		if a.cfg.Bot.ApproverUserID != 0 && req.UserID == a.cfg.Bot.ApproverUserID {
-			entry.NeverExpires = true
-			entry.ExpiresAt = nil
-		}
-		a.svc.EnsureUserExpiry(&entry)
-		st.Users[userKey] = entry
-		_ = a.svc.SaveState(st)
-
+	if outcome == "approved" {
 		text := "Заявка подтверждена.\n\n" + a.svc.BuildHappCodeMessage(links, a.svc.ExpiresAtInt(&entry))
 		if panelID, ok := a.getPanel(req.UserID); ok {
-			_, err = b.EditMessageText(ctx, &bot.EditMessageTextParams{
+			_, err := b.EditMessageText(ctx, &bot.EditMessageTextParams{
 				ChatID:    req.UserID,
 				MessageID: panelID,
 				Text:      text,
@@ -586,14 +622,9 @@ func (a *App) onDecision(ctx context.Context, b *bot.Bot, update *models.Update)
 		return
 	}
 
-	m, _ := raw.(map[string]interface{})
-	m["status"] = "rejected"
-	st.Requests[requestID] = m
-	_ = a.svc.SaveState(st)
-	req, _ := ParseRequest(requestID, raw)
 	rejText := fmt.Sprintf("Заявка отклонена пользователем %s.", a.svc.ApproverLabel())
 	if panelID, ok := a.getPanel(req.UserID); ok {
-		_, err = b.EditMessageText(ctx, &bot.EditMessageTextParams{
+		_, err := b.EditMessageText(ctx, &bot.EditMessageTextParams{
 			ChatID: req.UserID, MessageID: panelID, Text: rejText,
 		})
 		if err != nil {
@@ -632,29 +663,35 @@ func (a *App) onAction(ctx context.Context, b *bot.Bot, update *models.Update) {
 
 	switch action {
 	case "get":
-		st, err := a.svc.LoadState()
-		if err != nil {
-			return
-		}
-		a.svc.SweepExpiredUsers(st, 0)
 		label := q.From.Username
 		if label == "" {
 			label = "approver"
 		}
-		links, err := a.svc.GetOrCreateUserLink(st, strconv.FormatInt(q.From.ID, 10), label+"-happ")
-		if err != nil {
+		userKey := strconv.FormatInt(q.From.ID, 10)
+		var (
+			links map[string]map[string]string
+			entry config.UserEntry
+		)
+		if err := a.svc.WithState(func(st *config.State) error {
+			a.svc.SweepExpiredUsers(st, 0)
+			lm, err := a.svc.GetOrCreateUserLink(st, userKey, label+"-happ")
+			if err != nil {
+				return err
+			}
+			links = lm
+			e := st.Users[userKey]
+			if a.IsApprover(q.From.ID) {
+				e.NeverExpires = true
+				e.ExpiresAt = nil
+			}
+			a.svc.EnsureUserExpiry(&e)
+			st.Users[userKey] = e
+			entry = e
+			return nil
+		}); err != nil {
 			a.reply(ctx, b, msg, "Ошибка: "+err.Error(), nil)
 			return
 		}
-		userKey := strconv.FormatInt(q.From.ID, 10)
-		entry := st.Users[userKey]
-		if a.IsApprover(q.From.ID) {
-			entry.NeverExpires = true
-			entry.ExpiresAt = nil
-		}
-		a.svc.EnsureUserExpiry(&entry)
-		st.Users[userKey] = entry
-		_ = a.svc.SaveState(st)
 		a.replyMD(ctx, b, msg, a.svc.BuildHappCodeMessage(links, a.svc.ExpiresAtInt(&entry)), AdminMenuKeyboard())
 	case "create":
 		a.pendingMu.Lock()
@@ -707,7 +744,7 @@ func (a *App) createSubscriptionRequestFromCallback(ctx context.Context, b *bot.
 	}
 	now := time.Now().Unix()
 	requestID := fmt.Sprintf("%d-%d", q.From.ID, now)
-	req := Request{
+	req := config.Request{
 		RequestID: requestID,
 		UserID:    q.From.ID,
 		Username:  q.From.Username,
@@ -716,11 +753,14 @@ func (a *App) createSubscriptionRequestFromCallback(ctx context.Context, b *bot.
 		CreatedAt: now,
 	}
 	var approverChatID *int64
-	_ = a.svc.WithState(func(st *config.State) error {
-		st.Requests[requestID] = req.ToMap()
+	if err := a.svc.WithState(func(st *config.State) error {
+		st.Requests[requestID] = req
 		approverChatID = st.ApproverChatID
 		return nil
-	})
+	}); err != nil {
+		a.reply(ctx, b, msg, "Не удалось сохранить заявку: "+err.Error(), nil)
+		return
+	}
 	var text string
 	if approverChatID == nil {
 		text = fmt.Sprintf(
@@ -817,42 +857,11 @@ func (a *App) handleUserDo(ctx context.Context, b *bot.Bot, msg *models.Message,
 }
 
 func (a *App) syncUserByID(ctx context.Context, b *bot.Bot, msg *models.Message, targetUserID string) {
-	st, err := a.svc.LoadState()
+	added, err := a.svc.SyncUser(targetUserID)
 	if err != nil {
+		a.reply(ctx, b, msg, "Ошибка синхронизации: "+err.Error(), nil)
 		return
 	}
-	userData, ok := st.Users[targetUserID]
-	if !ok {
-		a.reply(ctx, b, msg, "Пользователь не найден в выданных.", nil)
-		return
-	}
-	clientUUID := strings.TrimSpace(userData.UUID)
-	if clientUUID == "" {
-		a.reply(ctx, b, msg, "У пользователя нет uuid в state.", nil)
-		return
-	}
-	if userData.Servers == nil {
-		userData.Servers = map[string]map[string]string{}
-	}
-	var added []string
-	for _, server := range a.cfg.Servers {
-		if _, exists := userData.Servers[server.Host]; exists {
-			continue
-		}
-		if err := a.svc.UpsertXrayClient(&server, clientUUID); err != nil {
-			a.reply(ctx, b, msg, "Ошибка синхронизации: "+err.Error(), nil)
-			return
-		}
-		linksMap, err := a.svc.BuildServerLinks(&server, clientUUID)
-		if err != nil {
-			a.reply(ctx, b, msg, "Ошибка синхронизации: "+err.Error(), nil)
-			return
-		}
-		userData.Servers[server.Host] = linksMap
-		added = append(added, server.Host)
-	}
-	st.Users[targetUserID] = userData
-	_ = a.svc.SaveState(st)
 	if len(added) > 0 {
 		a.reply(ctx, b, msg, fmt.Sprintf("Пользователь %s синхронизирован. Добавлены: %s", targetUserID, strings.Join(added, ", ")), AdminMenuKeyboard())
 		return
@@ -861,31 +870,11 @@ func (a *App) syncUserByID(ctx context.Context, b *bot.Bot, msg *models.Message,
 }
 
 func (a *App) revokeUserByID(ctx context.Context, b *bot.Bot, msg *models.Message, targetUserID string) {
-	st, err := a.svc.LoadState()
+	removed, err := a.svc.RevokeUser(targetUserID)
 	if err != nil {
+		a.reply(ctx, b, msg, "Ошибка удаления: "+err.Error(), nil)
 		return
 	}
-	userData, ok := st.Users[targetUserID]
-	if !ok {
-		a.reply(ctx, b, msg, "Пользователь не найден в выданных.", nil)
-		return
-	}
-	clientUUID := strings.TrimSpace(userData.UUID)
-	var removed []string
-	if clientUUID != "" {
-		for _, server := range a.cfg.Servers {
-			ok, err := a.svc.RemoveXrayClient(&server, clientUUID)
-			if err != nil {
-				a.reply(ctx, b, msg, fmt.Sprintf("Ошибка удаления из Xray на %s: %v", server.Host, err), nil)
-				return
-			}
-			if ok {
-				removed = append(removed, server.Host)
-			}
-		}
-	}
-	delete(st.Users, targetUserID)
-	_ = a.svc.SaveState(st)
 	if len(removed) > 0 {
 		a.reply(ctx, b, msg, fmt.Sprintf("Пользователь %s удален из state и Xray на: %s", targetUserID, strings.Join(removed, ", ")), AdminMenuKeyboard())
 		return
@@ -894,24 +883,30 @@ func (a *App) revokeUserByID(ctx context.Context, b *bot.Bot, msg *models.Messag
 }
 
 func (a *App) sendUserSubscriptionByID(ctx context.Context, b *bot.Bot, msg *models.Message, targetUserID string) {
-	st, err := a.svc.LoadState()
+	var (
+		servers map[string]map[string]string
+		expiry  *int64
+	)
+	err := a.svc.WithState(func(st *config.State) error {
+		userData, ok := st.Users[targetUserID]
+		if !ok || len(userData.Servers) == 0 {
+			return fmt.Errorf("пользователь не найден или ссылки отсутствуют")
+		}
+		if a.svc.IsUserExpired(&userData, 0) {
+			return fmt.Errorf("подписка пользователя истекла")
+		}
+		a.svc.EnsureUserExpiry(&userData)
+		st.Users[targetUserID] = userData
+		servers = userData.Servers
+		expiry = a.svc.ExpiresAtInt(&userData)
+		return nil
+	})
 	if err != nil {
+		a.reply(ctx, b, msg, err.Error(), nil)
 		return
 	}
-	userData, ok := st.Users[targetUserID]
-	if !ok || len(userData.Servers) == 0 {
-		a.reply(ctx, b, msg, "Пользователь не найден или ссылки отсутствуют.", nil)
-		return
-	}
-	if a.svc.IsUserExpired(&userData, 0) {
-		a.reply(ctx, b, msg, "Подписка пользователя истекла.", nil)
-		return
-	}
-	a.svc.EnsureUserExpiry(&userData)
-	st.Users[targetUserID] = userData
-	_ = a.svc.SaveState(st)
 	targetID, _ := strconv.ParseInt(targetUserID, 10, 64)
-	text := "Твоя подписка (повторная отправка):\n\n" + a.svc.BuildHappCodeMessage(userData.Servers, a.svc.ExpiresAtInt(&userData))
+	text := "Твоя подписка (повторная отправка):\n\n" + a.svc.BuildHappCodeMessage(servers, expiry)
 	if err := a.sendSubscription(ctx, b, targetID, text, nil); err != nil {
 		a.reply(ctx, b, msg, "Не удалось отправить сообщение: "+err.Error(), nil)
 		return
@@ -920,37 +915,11 @@ func (a *App) sendUserSubscriptionByID(ctx context.Context, b *bot.Bot, msg *mod
 }
 
 func (a *App) renewUserByID(ctx context.Context, b *bot.Bot, msg *models.Message, targetUserID string, days int) {
-	if days <= 0 {
-		a.reply(ctx, b, msg, "days должно быть положительным.", nil)
-		return
-	}
-	st, err := a.svc.LoadState()
+	exp, err := a.svc.RenewUser(targetUserID, days)
 	if err != nil {
+		a.reply(ctx, b, msg, "Ошибка продления: "+err.Error(), nil)
 		return
 	}
-	a.svc.SweepExpiredUsers(st, 0)
-	userData, ok := st.Users[targetUserID]
-	if !ok {
-		a.reply(ctx, b, msg, "Пользователь не найден.", nil)
-		return
-	}
-	if userData.NeverExpires {
-		a.reply(ctx, b, msg, "У пользователя включена бессрочная подписка. Сначала отключите её.", nil)
-		return
-	}
-	nowTS := time.Now().Unix()
-	var current int64
-	if userData.ExpiresAt != nil {
-		current = *userData.ExpiresAt
-	}
-	base := current
-	if base <= nowTS {
-		base = nowTS
-	}
-	exp := base + int64(days)*24*3600
-	userData.ExpiresAt = &exp
-	st.Users[targetUserID] = userData
-	_ = a.svc.SaveState(st)
 	a.reply(ctx, b, msg, fmt.Sprintf(
 		"Подписка пользователя %s продлена на %d дн.\nИстекает: %s",
 		targetUserID, days, a.svc.FormatTS(exp),
@@ -958,24 +927,10 @@ func (a *App) renewUserByID(ctx context.Context, b *bot.Bot, msg *models.Message
 }
 
 func (a *App) neverExpiresByID(ctx context.Context, b *bot.Bot, msg *models.Message, targetUserID string, value bool) {
-	st, err := a.svc.LoadState()
-	if err != nil {
+	if err := a.svc.SetNeverExpires(targetUserID, value); err != nil {
+		a.reply(ctx, b, msg, "Ошибка: "+err.Error(), nil)
 		return
 	}
-	a.svc.SweepExpiredUsers(st, 0)
-	userData, ok := st.Users[targetUserID]
-	if !ok {
-		a.reply(ctx, b, msg, "Пользователь не найден.", nil)
-		return
-	}
-	userData.NeverExpires = value
-	if value {
-		userData.ExpiresAt = nil
-	} else {
-		a.svc.EnsureUserExpiry(&userData)
-	}
-	st.Users[targetUserID] = userData
-	_ = a.svc.SaveState(st)
 	status := "отключена"
 	if value {
 		status = "включена"

@@ -259,7 +259,7 @@ func Backup(paths config.Paths) error {
 	return nil
 }
 
-const cleanupScript = `
+var cleanupScript = fmt.Sprintf(`
 set +e
 echo "=== cleanup on $(hostname) ==="
 echo "[1/4] stopping services..."
@@ -281,14 +281,14 @@ if [ -x /usr/local/bin/xray ] || systemctl list-unit-files xray.service >/dev/nu
   systemctl daemon-reload 2>/dev/null || true
 fi
 echo "[3/5] removing bot and legacy files..."
-rm -rf /root/ssh /etc/hysteria /etc/wireguard/warp.conf /etc/wireguard/wgcf-account.toml \
+rm -rf %s /etc/hysteria /etc/wireguard/warp.conf /etc/wireguard/wgcf-account.toml \
   /etc/wireguard/wgcf-profile.conf /usr/local/bin/hysteria /usr/local/bin/wgcf /tmp/install_key_target.py
 echo "[4/5] clearing root ~/.ssh (authorized_keys)..."
 rm -rf /root/.ssh
 echo "[5/5] daemon-reload..."
 systemctl daemon-reload 2>/dev/null || true
 echo "cleanup done"
-`
+`, remoteRoot)
 
 func Cleanup(paths config.Paths) error {
 	cfg, sec, _, err := config.LoadAll(paths)
@@ -472,12 +472,12 @@ func buildUUIDCheck(uuids []string) string {
 	raw, _ := json.Marshal(uuids)
 	return fmt.Sprintf(`python3 - <<'PY'
 import json
-c = json.load(open('/usr/local/etc/xray/config.json'))
+c = json.load(open('%s'))
 ids = {cl['id'] for ib in c.get('inbounds', []) if ib.get('protocol') == 'vless' for cl in ib.get('settings', {}).get('clients', [])}
 exp = set(json.loads(%q))
 missing = sorted(exp - ids)
 print('ok' if not missing else 'missing:' + ','.join(missing))
-PY`, string(raw))
+PY`, xray.ConfigPath, string(raw))
 }
 
 func splitLines(s string) []string {
@@ -520,7 +520,7 @@ func All(paths config.Paths, forceKeys, skipBot bool) error {
 		logf("skip Telegram bot (--no-bot)")
 	} else {
 		phase("[4/5] Telegram bot")
-		if err := Bot(paths); err != nil {
+		if err := Bot(paths, false); err != nil {
 			return err
 		}
 	}
@@ -586,7 +586,7 @@ func Bootstrap(paths config.Paths, cleanupFirst, skipBot bool) error {
 		logf("skip Telegram bot (--no-bot)")
 	} else {
 		phase(fmt.Sprintf("[%d/%d] Telegram bot", stepN, total))
-		if err := Bot(paths); err != nil {
+		if err := Bot(paths, false); err != nil {
 			return err
 		}
 		stepN++

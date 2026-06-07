@@ -1,5 +1,8 @@
 # Рабочее состояние — управляется vpnctl users и/или tgbot.
 # vpnctl init копирует в state.yaml (пустой до первого подписчика).
+#
+# С ботом: каноничная копия на VPS (bot.server_id) в /root/ssh/state.yaml.
+# Перед redeploy: vpnctl bot pull-state. Принудительная заливка: vpnctl bot --force-state.
 
 approver_chat_id: null    # выставляет бот, когда админ отправляет /start
 last_expiry_sweep_at: 0

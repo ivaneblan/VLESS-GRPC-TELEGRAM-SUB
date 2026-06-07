@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -129,7 +130,7 @@ func ParseState(data []byte) (*State, error) {
 		return nil, err
 	}
 	if st.Requests == nil {
-		st.Requests = map[string]interface{}{}
+		st.Requests = map[string]Request{}
 	}
 	if st.Users == nil {
 		st.Users = map[string]UserEntry{}
@@ -139,9 +140,29 @@ func ParseState(data []byte) (*State, error) {
 
 func emptyState() *State {
 	return &State{
-		Requests: map[string]interface{}{},
+		Requests: map[string]Request{},
 		Users:    map[string]UserEntry{},
 	}
+}
+
+// MutateState performs an atomic, lock-guarded read-modify-write of the state
+// file: it takes an OS-level exclusive lock, loads the current state, applies
+// fn, and writes the result back atomically. fn returning an error aborts the
+// write, leaving the on-disk state unchanged.
+func MutateState(path string, fn func(*State) error) error {
+	lock, err := acquireLock(path + ".lock")
+	if err != nil {
+		return fmt.Errorf("lock state: %w", err)
+	}
+	defer lock.release()
+	st, err := LoadState(path)
+	if err != nil {
+		return err
+	}
+	if err := fn(st); err != nil {
+		return err
+	}
+	return SaveState(path, st)
 }
 
 func SaveConfig(path string, cfg *Config) error {
@@ -162,12 +183,36 @@ func SaveState(path string, st *State) error {
 	return writeYAML(path, st)
 }
 
+// writeYAML serialises v and writes it atomically: it writes to a temp file in
+// the same directory and renames it into place, so a crash mid-write can never
+// leave a truncated config/state file.
 func writeYAML(path string, v interface{}) error {
 	data, err := yaml.Marshal(v)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 func joinPath(root, rel string) string {

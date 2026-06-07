@@ -10,6 +10,7 @@ import (
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/config"
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/deploy"
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/logx"
+	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/sshclient"
 	"github.com/spf13/cobra"
 )
 
@@ -59,6 +60,12 @@ Typical first run:
 	root.PersistentFlags().BoolVar(&verbose, "verbose", false, "verbose (debug-level) logging")
 	root.PersistentPreRun = func(cmd *cobra.Command, args []string) {
 		logx.Setup(logJSON, verbose)
+		// Honour ssh.strict_host_key from config when it is available (it is not
+		// during `vpnctl init`, before config.yaml exists).
+		p := config.DefaultPaths(paths.Root)
+		if cfg, err := config.LoadConfig(p.ConfigPath); err == nil {
+			sshclient.StrictHostKey = cfg.SSH.StrictHostKey
+		}
 	}
 
 	root.AddGroup(
@@ -232,6 +239,7 @@ func vlessCmd(paths *config.Paths) *cobra.Command {
 }
 
 func botCmd(paths *config.Paths) *cobra.Command {
+	var forceState bool
 	bot := &cobra.Command{
 		Use:     "bot",
 		Short:   "Deploy Telegram bot (tgbot) via systemd",
@@ -240,13 +248,15 @@ func botCmd(paths *config.Paths) *cobra.Command {
 
 Run without a subcommand to (re)deploy the bot. The bot keeps its own
 state.yaml on the bot server and writes users added via Telegram there.
-Before redeploying, run "vpnctl bot pull-state" to copy those users back,
-otherwise the deploy overwrites the server state with your local copy.`,
+By default the deploy keeps a non-empty remote state.yaml; run
+"vpnctl bot pull-state" first to copy those users back locally, or pass
+--force-state to overwrite the server state with your local copy.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			*paths = config.DefaultPaths(paths.Root)
-			return deploy.Bot(*paths)
+			return deploy.Bot(*paths, forceState)
 		},
 	}
+	bot.Flags().BoolVar(&forceState, "force-state", false, "overwrite remote state.yaml with the local copy")
 	bot.AddCommand(&cobra.Command{
 		Use:   "pull-state",
 		Short: "Download state.yaml from the bot server (backs up local first)",

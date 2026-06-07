@@ -22,7 +22,7 @@ const (
 	localBotLinux  = "dist/tgbot-linux-amd64"
 )
 
-func Bot(paths config.Paths) error {
+func Bot(paths config.Paths, forceState bool) error {
 	cfg, sec, _, err := config.LoadAll(paths)
 	if err != nil {
 		return err
@@ -53,7 +53,7 @@ func Bot(paths config.Paths) error {
 	connectedMsg(botServer.Host)
 
 	logf("upload bot binary to %s", remoteBotBin)
-	if err := uploadBotBundle(client, paths); err != nil {
+	if err := uploadBotBundle(client, paths, forceState); err != nil {
 		return err
 	}
 	logf("stop old bot process")
@@ -66,6 +66,8 @@ func Bot(paths config.Paths) error {
 		return err
 	}
 	logf("systemctl daemon-reload + enable + restart")
+	// Best-effort: daemon-reload/enable failures are not fatal; the restart below
+	// and the is-active check are the authoritative success signals.
 	_, _, _ = client.Run("systemctl daemon-reload", 30*time.Second)
 	_, _, _ = client.Run("systemctl enable "+serviceName, 30*time.Second)
 	rc, out, errStr := client.Run("systemctl restart "+serviceName, 60*time.Second)
@@ -160,7 +162,22 @@ func ensureBotBinary(paths config.Paths) error {
 	return nil
 }
 
-func uploadBotBundle(client *sshclient.Client, paths config.Paths) error {
+// remoteStateHasUsers reports whether the bot server already holds a non-empty
+// state.yaml with at least one user. Used to avoid clobbering users added via
+// Telegram with a stale local copy during redeploy.
+func remoteStateHasUsers(client *sshclient.Client) bool {
+	data, err := sshclient.DownloadBytes(client, remoteRoot+"/state.yaml")
+	if err != nil {
+		return false
+	}
+	st, err := config.ParseState(data)
+	if err != nil {
+		return len(strings.TrimSpace(string(data))) > 0
+	}
+	return len(st.Users) > 0
+}
+
+func uploadBotBundle(client *sshclient.Client, paths config.Paths, forceState bool) error {
 	localBin := filepath.Join(paths.Root, filepath.FromSlash(localBotLinux))
 	// Upload to a temp path and atomically replace: overwriting the binary in
 	// place fails with ETXTBSY while the old bot process is still running.
@@ -199,10 +216,17 @@ func uploadBotBundle(client *sshclient.Client, paths config.Paths) error {
 	if err := sshclient.UploadBytes(client, remoteRoot+"/secrets.yaml", secData); err != nil {
 		return err
 	}
-	if err := sshclient.UploadBytes(client, remoteRoot+"/state.yaml", stData); err != nil {
-		return err
+	// The running bot owns state.yaml (it writes users added via Telegram). Do
+	// not overwrite a non-empty remote state with the local copy unless forced;
+	// use "vpnctl bot pull-state" first to sync those users locally.
+	if !forceState && remoteStateHasUsers(client) {
+		logf("uploaded config.yaml, secrets.yaml (kept remote state.yaml; use --force-state to overwrite, or 'vpnctl bot pull-state' to sync local first)")
+	} else {
+		if err := sshclient.UploadBytes(client, remoteRoot+"/state.yaml", stData); err != nil {
+			return err
+		}
+		logf("uploaded config.yaml, secrets.yaml, state.yaml")
 	}
-	logf("uploaded config.yaml, secrets.yaml, state.yaml")
 
 	privKey := filepath.Join(paths.KeysDir, "id_ed25519")
 	if _, err := os.Stat(privKey); err == nil {
@@ -266,6 +290,8 @@ func stopBotRemote(server config.ServerDef, sec *config.Secrets) error {
 }
 
 func stopBotService(client *sshclient.Client, disable bool) error {
+	// Best-effort teardown: a missing process/unit is the desired end state, so
+	// non-zero exit codes here are expected and intentionally ignored.
 	_, _, _ = client.Run("pkill -f '[t]gbot' || true", 15*time.Second)
 	_, _, _ = client.Run("pkill -f '[b]ot.py' || true", 15*time.Second)
 	_, _, _ = client.Run("systemctl stop "+serviceName+" 2>/dev/null || true", 15*time.Second)

@@ -6,7 +6,9 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/config"
@@ -15,6 +17,72 @@ import (
 )
 
 const defaultUser = "root"
+
+var (
+	// KnownHostsPath is where server host keys are pinned (trust-on-first-use).
+	// It is resolved relative to the process working directory, which for both
+	// vpnctl and the bot is the project root.
+	KnownHostsPath = filepath.Join("keys", "known_hosts")
+	// StrictHostKey, when true, refuses connecting to a host whose key is not
+	// already pinned. Default false keeps TOFU: unknown hosts are learned, but a
+	// changed key (possible MITM) is always rejected.
+	StrictHostKey bool
+	knownHostsMu  sync.Mutex
+)
+
+// hostKeyCallback verifies the server key against keys/known_hosts. The first
+// time a host is seen its key is pinned; subsequent connections must match.
+func hostKeyCallback() ssh.HostKeyCallback {
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		knownHostsMu.Lock()
+		defer knownHostsMu.Unlock()
+		want := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))
+		if data, err := os.ReadFile(KnownHostsPath); err == nil {
+			for _, ln := range strings.Split(string(data), "\n") {
+				h, k, ok := splitKnownHostLine(ln)
+				if !ok || h != hostname {
+					continue
+				}
+				if k == want {
+					return nil
+				}
+				return fmt.Errorf("host key mismatch for %s (possible MITM); if the change is expected, remove its line from %s", hostname, KnownHostsPath)
+			}
+		}
+		if StrictHostKey {
+			return fmt.Errorf("unknown host key for %s and strict mode is on; pin it in %s to proceed", hostname, KnownHostsPath)
+		}
+		if err := appendKnownHost(KnownHostsPath, hostname, want); err != nil {
+			return fmt.Errorf("pin host key for %s: %w", hostname, err)
+		}
+		return nil
+	}
+}
+
+func splitKnownHostLine(line string) (host, key string, ok bool) {
+	line = strings.TrimSpace(line)
+	if line == "" || strings.HasPrefix(line, "#") {
+		return "", "", false
+	}
+	idx := strings.IndexByte(line, ' ')
+	if idx <= 0 {
+		return "", "", false
+	}
+	return line[:idx], strings.TrimSpace(line[idx+1:]), true
+}
+
+func appendKnownHost(path, host, key string) error {
+	if dir := filepath.Dir(path); dir != "" {
+		_ = os.MkdirAll(dir, 0o700)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(host + " " + key + "\n")
+	return err
+}
 
 type Client struct {
 	conn     *ssh.Client
@@ -62,7 +130,7 @@ func Connect(host string, sec *config.Secrets, serverID string) (*Client, error)
 	cfg := &ssh.ClientConfig{
 		User:            defaultUser,
 		Auth:            auth,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: hostKeyCallback(),
 	}
 
 	addr := host + ":22"
@@ -90,7 +158,7 @@ func ConnectPassword(host, password string) (*Client, error) {
 	cfg := &ssh.ClientConfig{
 		User:            defaultUser,
 		Auth:            []ssh.AuthMethod{ssh.Password(password)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: hostKeyCallback(),
 	}
 	addr := host + ":22"
 	tcpConn, err := net.DialTimeout("tcp", addr, 15*time.Second)

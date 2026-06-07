@@ -22,7 +22,7 @@
 
 ## Быстрый старт
 
-Нужен **Go 1.22+** (или готовый бинарник из релиза, когда появится).
+Нужен **Go 1.23+** (или готовый бинарник из релиза, когда появится).
 
 ```powershell
 # Windows
@@ -51,6 +51,8 @@ make build    # или: go build -o vpnctl ./cmd/vpnctl
 | Переустановка, подписчиков сохранить | `vpnctl redeploy` |
 | Добавить сервер к существующей схеме | правка `config.yaml` → `vpnctl vless newid` → `vpnctl users sync ID` для каждого пользователя |
 | Добавить RU-мост (обход ТСПУ) | в `config.yaml` сервер с `relay_to: <exit_id>` → `vpnctl keys` → `vpnctl vless` → `vpnctl links refresh` |
+| Перед redeploy бота подтянуть пользователей с VPS | `vpnctl bot pull-state` |
+| Redeploy бота, перезаписав state на VPS локальным | `vpnctl bot --force-state` (осторожно) |
 
 ### Мост / jump-host (обход ТСПУ)
 
@@ -75,6 +77,7 @@ make build    # или: go build -o vpnctl ./cmd/vpnctl
 | `bot.server_id` | любой id сервера (хост бота, если задеплоите позже) | id VPS с ботом |
 | `bot.approver_user_id` | `0` или не заполнять | ваш числовой Telegram id |
 | `bot.default_subscription_days` | используется в `users add` | то же |
+| `ssh.strict_host_key` | опционально, по умолчанию `false` | то же |
 
 ### secrets.yaml (обязательно)
 
@@ -87,15 +90,26 @@ make build    # или: go build -o vpnctl ./cmd/vpnctl
 
 Изначально пустой. Заполняется через `vpnctl users add` или одобрения в Telegram-боте.
 
+**Источник истины при работе с ботом:** пока `tgbot` запущен на VPS (`bot.server_id`), каноничная копия — `/root/ssh/state.yaml` на этом хосте. Пользователи, добавленные через Telegram, попадают туда. Локальный `state.yaml` на вашей машине — рабочая копия для CLI; держите их в синхронизации.
+
+Запись state атомарна (temp + rename) и защищена файловой блокировкой на Linux (`state.yaml.lock`). Бот и CLI не должны одновременно менять **разные** копии state без синхронизации.
+
 **Не копируйте вручную:**
 
 | Что | Откуда берётся |
 |-----|----------------|
 | SSH-ключи | `vpnctl init` → `keys/` |
+| SSH host keys (TOFU) | первое подключение → `keys/known_hosts` |
 | Reality-ключи | `vpnctl vless` / `bootstrap` → `secrets.yaml` |
 | UUID и ссылки пользователей | `vpnctl users add` или бот |
 
-**Перед `vpnctl bot`:** локальный `state.yaml` загружается на сервер и перезаписывает `/root/ssh/state.yaml`. При необходимости сначала синхронизируйте с хоста бота.
+**Перед `vpnctl bot` (redeploy):**
+
+1. `vpnctl bot pull-state` — скачать актуальный state с VPS бота (локальный файл бэкапится как `state.yaml.<timestamp>.bak`).
+2. `vpnctl bot` — деплой бинарника и конфигов. **Удалённый `state.yaml` не перезаписывается**, если на сервере уже есть пользователи.
+3. `vpnctl bot --force-state` — явно залить локальный `state.yaml` поверх удалённого (используйте только если уверены).
+
+**Только CLI (`--no-bot`):** каноничен локальный `state.yaml` в каталоге проекта.
 
 ## Файлы конфигурации
 
@@ -107,6 +121,8 @@ make build    # или: go build -o vpnctl ./cmd/vpnctl
 | `config.yaml` | нет | серверы, xray, настройки бота |
 | `secrets.yaml` | нет | пароли, токен, Reality-ключи |
 | `state.yaml` | нет | пользователи, подписки, заявки бота |
+| `keys/known_hosts` | нет | закреплённые SSH host keys серверов (TOFU) |
+| `state.yaml.lock` | нет | lock-файл (создаётся на VPS бота при работе tgbot) |
 
 ## Справочник команд
 
@@ -120,7 +136,8 @@ make build    # или: go build -o vpnctl ./cmd/vpnctl
 | `vpnctl all [--no-bot]` | keys → vless → links refresh → [bot] → check |
 | `vpnctl keys` | Установить SSH public key на все серверы |
 | `vpnctl vless [id...] [--new-keys]` | Деплой/обновление Xray |
-| `vpnctl bot` | Загрузить `tgbot` и конфиги на VPS бота |
+| `vpnctl bot [--force-state]` | Загрузить `tgbot` и конфиги на VPS бота |
+| `vpnctl bot pull-state` | Скачать `state.yaml` с VPS бота → локальный (с бэкапом) |
 | `vpnctl links refresh` | Пересобрать VLESS-ссылки в `state.yaml` |
 | `vpnctl check` | Xray активен, UUID на месте |
 | `vpnctl backup` | Снимок yaml → `backups/` |
@@ -178,11 +195,25 @@ vpnctl passwd de --password 'NewSecurePass123'
 Деплой: `vpnctl bot` или `vpnctl bootstrap` (без `--no-bot`).
 
 - Бинарник: `dist/tgbot-linux-amd64` → `/root/ssh/tgbot` (собирается автоматически, если файла нет)
+- Рабочий каталог на VPS: `/root/ssh` (`config.yaml`, `secrets.yaml`, `state.yaml`)
 - Сервис: `tg-subscription-bot.service`
 
 ```bash
 systemctl status tg-subscription-bot
 journalctl -u tg-subscription-bot -f
+```
+
+**Синхронизация state:**
+
+```powershell
+# Пользователи добавлены через бота — подтянуть локально перед CLI-операциями
+vpnctl bot pull-state
+
+# Redeploy бота (state на VPS сохранится, если там уже есть пользователи)
+vpnctl bot
+
+# Принудительно перезаписать state на VPS локальной копией
+vpnctl bot --force-state
 ```
 
 Функции бота дублируют CLI: одобрение заявок, создание пользователя/подписки (кнопка «➕ Создать пользователя» или `/add_user <user_id> [days|never] [label]`, аналог `vpnctl users add`), renew/revoke/sync, трафик и статус. Нужны `telegram.bot_token` и `bot.approver_user_id` в конфиге.
@@ -228,4 +259,8 @@ state.example.yaml
 
 ## Безопасность
 
-Не коммитьте `config.yaml`, `secrets.yaml`, `state.yaml`, `keys/` и `backups/`.
+Не коммитьте `config.yaml`, `secrets.yaml`, `state.yaml`, `keys/` (включая `known_hosts`) и `backups/`.
+
+**SSH host key verification (TOFU):** при первом подключении к серверу его host key сохраняется в `keys/known_hosts`. При смене ключа на сервере (переустановка VPS) подключение будет отклонено с ошибкой «host key mismatch» — удалите соответствующую строку из `known_hosts` и подключитесь снова.
+
+**Строгий режим:** `ssh.strict_host_key: true` в `config.yaml` запрещает подключение к неизвестным хостам (без автоматического пиннинга). Подходит для production после ручного заполнения `known_hosts`.

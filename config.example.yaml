@@ -3,6 +3,10 @@
 
 subscription_title: smknVPN     # имя группы серверов в Happ (#profile-title, до 25 символов)
 
+# SSH-подключения vpnctl/tgbot к серверам (опционально)
+ssh:
+  strict_host_key: false        # true = отказ без записи в keys/known_hosts (TOFU по умолчанию)
+
 bot:
   server_id: de                 # servers[].id для tgbot (если деплоите); любой id для режима только CLI
   approver_user_id: 0           # Telegram id админа — нужен только с ботом

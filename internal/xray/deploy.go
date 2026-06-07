@@ -91,6 +91,8 @@ func Deploy(client *sshclient.Client, cfg *config.Config, sec *config.Secrets, s
 	}
 
 	logx.Infof("configuring firewall + systemd...")
+	// Best-effort: a missing ufw or an already-enabled unit is not fatal here;
+	// the authoritative check is the `systemctl is-active xray` verification below.
 	_, _, _ = client.Run("command -v ufw >/dev/null 2>&1 && ufw allow 443/tcp || true", 30*time.Second)
 	_, _, _ = client.Run("systemctl daemon-reload", 30*time.Second)
 	_, _, _ = client.Run("systemctl enable xray", 30*time.Second)
@@ -379,14 +381,9 @@ func applyConfig(client *sshclient.Client, cfg map[string]interface{}) (bool, er
 			changed = !jsonEqual(remote, cfg)
 		}
 	}
-	hex := fmt.Sprintf("%x", raw)
-	writePy := fmt.Sprintf(
-		"python3 -c \"from pathlib import Path; Path('%s').write_bytes(bytes.fromhex('%s'))\"",
-		ConfigPath, hex,
-	)
-	rc, out, errStr := client.Run(writePy, 60*time.Second)
-	if rc != 0 {
-		return false, fmt.Errorf("write config: %s %s", out, errStr)
+	// Write via SFTP (no python3 dependency on the remote host).
+	if err := sshclient.UploadBytes(client, ConfigPath, raw); err != nil {
+		return false, fmt.Errorf("write config: %w", err)
 	}
 	return changed, nil
 }
@@ -404,32 +401,45 @@ func UpsertClient(client *sshclient.Client, uuid string, flow string) error {
 	}
 	var cfg map[string]interface{}
 	if err := json.Unmarshal([]byte(out), &cfg); err != nil {
-		return err
+		return fmt.Errorf("parse xray config: %w", err)
 	}
-	inbounds, _ := cfg["inbounds"].([]interface{})
+	inbounds, ok := cfg["inbounds"].([]interface{})
+	if !ok || len(inbounds) == 0 {
+		return fmt.Errorf("unexpected xray config: no inbounds array")
+	}
 	changed := false
+	foundVless := false
 	for _, ib := range inbounds {
-		inbound, _ := ib.(map[string]interface{})
-		if inbound["protocol"] != "vless" {
+		inbound, ok := ib.(map[string]interface{})
+		if !ok || inbound["protocol"] != "vless" {
 			continue
 		}
-		settings, _ := inbound["settings"].(map[string]interface{})
+		foundVless = true
+		settings, ok := inbound["settings"].(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("unexpected xray config: vless inbound has no settings object")
+		}
 		clientsRaw, _ := settings["clients"].([]interface{})
+		exists := false
 		for _, c := range clientsRaw {
-			cm, _ := c.(map[string]interface{})
-			if cm["id"] == uuid {
-				return nil
+			if cm, ok := c.(map[string]interface{}); ok && cm["id"] == uuid {
+				exists = true
+				break
 			}
 		}
-		entry := map[string]string{"id": uuid}
-		settings["clients"] = append(clientsRaw, entry)
+		if exists {
+			continue
+		}
+		settings["clients"] = append(clientsRaw, map[string]string{"id": uuid})
 		changed = true
+	}
+	if !foundVless {
+		return fmt.Errorf("unexpected xray config: no vless inbound found")
 	}
 	if !changed {
 		return nil
 	}
-	_, err := applyConfig(client, cfg)
-	if err != nil {
+	if _, err := applyConfig(client, cfg); err != nil {
 		return err
 	}
 	return restartXray(client)
@@ -442,21 +452,26 @@ func RemoveClient(client *sshclient.Client, uuid string) (bool, error) {
 	}
 	var cfg map[string]interface{}
 	if err := json.Unmarshal([]byte(out), &cfg); err != nil {
-		return false, err
+		return false, fmt.Errorf("parse xray config: %w", err)
+	}
+	inbounds, ok := cfg["inbounds"].([]interface{})
+	if !ok || len(inbounds) == 0 {
+		return false, fmt.Errorf("unexpected xray config: no inbounds array")
 	}
 	removed := false
-	inbounds, _ := cfg["inbounds"].([]interface{})
 	for _, ib := range inbounds {
-		inbound, _ := ib.(map[string]interface{})
-		if inbound["protocol"] != "vless" {
+		inbound, ok := ib.(map[string]interface{})
+		if !ok || inbound["protocol"] != "vless" {
 			continue
 		}
-		settings, _ := inbound["settings"].(map[string]interface{})
+		settings, ok := inbound["settings"].(map[string]interface{})
+		if !ok {
+			continue
+		}
 		clientsRaw, _ := settings["clients"].([]interface{})
 		newClients := make([]interface{}, 0, len(clientsRaw))
 		for _, c := range clientsRaw {
-			cm, _ := c.(map[string]interface{})
-			if cm["id"] == uuid {
+			if cm, ok := c.(map[string]interface{}); ok && cm["id"] == uuid {
 				removed = true
 				continue
 			}
@@ -467,8 +482,7 @@ func RemoveClient(client *sshclient.Client, uuid string) (bool, error) {
 	if !removed {
 		return false, nil
 	}
-	_, err := applyConfig(client, cfg)
-	if err != nil {
+	if _, err := applyConfig(client, cfg); err != nil {
 		return false, err
 	}
 	if err := restartXray(client); err != nil {

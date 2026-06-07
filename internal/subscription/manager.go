@@ -40,17 +40,14 @@ func (m *Manager) SaveState(st *config.State) error {
 	return config.SaveState(m.Paths.StatePath, st)
 }
 
+// WithState is the single atomic mutation primitive: it serialises in-process
+// callers via m.mu and guards cross-process access via an OS file lock, then
+// performs a read-modify-write of state.yaml. fn must not call LoadState,
+// SaveState or WithState again (the mutex is not reentrant).
 func (m *Manager) WithState(fn func(*config.State) error) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	st, err := config.LoadState(m.Paths.StatePath)
-	if err != nil {
-		return err
-	}
-	if err := fn(st); err != nil {
-		return err
-	}
-	return config.SaveState(m.Paths.StatePath, st)
+	return config.MutateState(m.Paths.StatePath, fn)
 }
 
 func (m *Manager) FormatTS(ts int64) string {
@@ -164,6 +161,10 @@ func (m *Manager) BuildServerLinks(server *config.ServerDef, clientUUID string) 
 	return links.BuildServerLinks(params, clientUUID), nil
 }
 
+// GetOrCreateUserLink ensures the user exists with an xray client on every
+// server and returns the per-server links. It mutates st in place and performs
+// remote xray writes, but does NOT persist state: callers must run it inside
+// WithState (or save st themselves) so the whole operation stays atomic.
 func (m *Manager) GetOrCreateUserLink(st *config.State, userID, label string) (map[string]map[string]string, error) {
 	userID = strings.TrimSpace(userID)
 	if userID == "" {
@@ -191,9 +192,6 @@ func (m *Manager) GetOrCreateUserLink(st *config.State, userID, label string) (m
 				info.Servers[server.Host] = linksMap
 			}
 			st.Users[userID] = info
-			if err := m.SaveState(st); err != nil {
-				return nil, err
-			}
 			return info.Servers, nil
 		}
 	}
@@ -217,105 +215,102 @@ func (m *Manager) GetOrCreateUserLink(st *config.State, userID, label string) (m
 		CreatedAt: now,
 		Servers:   serverLinks,
 	}
-	if err := m.SaveState(st); err != nil {
-		return nil, err
-	}
 	return serverLinks, nil
 }
 
 func (m *Manager) AddUser(userID, label string, never bool, days int) (map[string]map[string]string, error) {
-	st, err := m.LoadState()
+	var linksMap map[string]map[string]string
+	err := m.WithState(func(st *config.State) error {
+		m.SweepExpiredUsers(st, 0)
+		lbl := label
+		if lbl == "" {
+			lbl = fmt.Sprintf("user-%s-happ", userID)
+		}
+		lm, err := m.GetOrCreateUserLink(st, userID, lbl)
+		if err != nil {
+			return err
+		}
+		linksMap = lm
+		entry := st.Users[userID]
+		if never {
+			entry.NeverExpires = true
+			entry.ExpiresAt = nil
+		} else if days > 0 {
+			exp := time.Now().Unix() + int64(days)*24*3600
+			entry.ExpiresAt = &exp
+			entry.NeverExpires = false
+		} else {
+			m.EnsureUserExpiry(&entry)
+		}
+		st.Users[userID] = entry
+		return nil
+	})
 	if err != nil {
-		return nil, err
-	}
-	m.SweepExpiredUsers(st, 0)
-	if label == "" {
-		label = fmt.Sprintf("user-%s-happ", userID)
-	}
-	linksMap, err := m.GetOrCreateUserLink(st, userID, label)
-	if err != nil {
-		return nil, err
-	}
-	entry := st.Users[userID]
-	if never {
-		entry.NeverExpires = true
-		entry.ExpiresAt = nil
-	} else if days > 0 {
-		exp := time.Now().Unix() + int64(days)*24*3600
-		entry.ExpiresAt = &exp
-		entry.NeverExpires = false
-	} else {
-		m.EnsureUserExpiry(&entry)
-	}
-	st.Users[userID] = entry
-	if err := m.SaveState(st); err != nil {
 		return nil, err
 	}
 	return linksMap, nil
 }
 
 func (m *Manager) RevokeUser(userID string) ([]string, error) {
-	st, err := m.LoadState()
-	if err != nil {
-		return nil, err
-	}
-	userData, ok := st.Users[userID]
-	if !ok {
-		return nil, fmt.Errorf("user %s not found", userID)
-	}
-	clientUUID := strings.TrimSpace(userData.UUID)
 	var removed []string
-	if clientUUID != "" {
-		for _, server := range m.Cfg.Servers {
-			ok, err := m.RemoveXrayClient(&server, clientUUID)
-			if err != nil {
-				return nil, fmt.Errorf("%s: %w", server.Host, err)
-			}
-			if ok {
-				removed = append(removed, server.Host)
+	err := m.WithState(func(st *config.State) error {
+		userData, ok := st.Users[userID]
+		if !ok {
+			return fmt.Errorf("user %s not found", userID)
+		}
+		clientUUID := strings.TrimSpace(userData.UUID)
+		if clientUUID != "" {
+			for _, server := range m.Cfg.Servers {
+				ok, err := m.RemoveXrayClient(&server, clientUUID)
+				if err != nil {
+					return fmt.Errorf("%s: %w", server.Host, err)
+				}
+				if ok {
+					removed = append(removed, server.Host)
+				}
 			}
 		}
-	}
-	delete(st.Users, userID)
-	if err := m.SaveState(st); err != nil {
+		delete(st.Users, userID)
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	return removed, nil
 }
 
 func (m *Manager) SyncUser(userID string) ([]string, error) {
-	st, err := m.LoadState()
-	if err != nil {
-		return nil, err
-	}
-	userData, ok := st.Users[userID]
-	if !ok {
-		return nil, fmt.Errorf("user %s not found", userID)
-	}
-	clientUUID := strings.TrimSpace(userData.UUID)
-	if clientUUID == "" {
-		return nil, fmt.Errorf("user %s has no uuid", userID)
-	}
-	if userData.Servers == nil {
-		userData.Servers = map[string]map[string]string{}
-	}
 	var added []string
-	for _, server := range m.Cfg.Servers {
-		if _, exists := userData.Servers[server.Host]; exists {
-			continue
+	err := m.WithState(func(st *config.State) error {
+		userData, ok := st.Users[userID]
+		if !ok {
+			return fmt.Errorf("user %s not found", userID)
 		}
-		if err := m.UpsertXrayClient(&server, clientUUID); err != nil {
-			return nil, err
+		clientUUID := strings.TrimSpace(userData.UUID)
+		if clientUUID == "" {
+			return fmt.Errorf("user %s has no uuid", userID)
 		}
-		linksMap, err := m.BuildServerLinks(&server, clientUUID)
-		if err != nil {
-			return nil, err
+		if userData.Servers == nil {
+			userData.Servers = map[string]map[string]string{}
 		}
-		userData.Servers[server.Host] = linksMap
-		added = append(added, server.Host)
-	}
-	st.Users[userID] = userData
-	if err := m.SaveState(st); err != nil {
+		for _, server := range m.Cfg.Servers {
+			if _, exists := userData.Servers[server.Host]; exists {
+				continue
+			}
+			if err := m.UpsertXrayClient(&server, clientUUID); err != nil {
+				return err
+			}
+			linksMap, err := m.BuildServerLinks(&server, clientUUID)
+			if err != nil {
+				return err
+			}
+			userData.Servers[server.Host] = linksMap
+			added = append(added, server.Host)
+		}
+		st.Users[userID] = userData
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	return added, nil
@@ -325,54 +320,52 @@ func (m *Manager) RenewUser(userID string, days int) (int64, error) {
 	if days <= 0 {
 		return 0, fmt.Errorf("days must be positive")
 	}
-	st, err := m.LoadState()
+	var exp int64
+	err := m.WithState(func(st *config.State) error {
+		m.SweepExpiredUsers(st, 0)
+		userData, ok := st.Users[userID]
+		if !ok {
+			return fmt.Errorf("user %s not found", userID)
+		}
+		if userData.NeverExpires {
+			return fmt.Errorf("user %s has never-expires enabled", userID)
+		}
+		nowTS := time.Now().Unix()
+		var current int64
+		if userData.ExpiresAt != nil {
+			current = *userData.ExpiresAt
+		}
+		base := current
+		if base <= nowTS {
+			base = nowTS
+		}
+		exp = base + int64(days)*24*3600
+		userData.ExpiresAt = &exp
+		st.Users[userID] = userData
+		return nil
+	})
 	if err != nil {
-		return 0, err
-	}
-	m.SweepExpiredUsers(st, 0)
-	userData, ok := st.Users[userID]
-	if !ok {
-		return 0, fmt.Errorf("user %s not found", userID)
-	}
-	if userData.NeverExpires {
-		return 0, fmt.Errorf("user %s has never-expires enabled", userID)
-	}
-	nowTS := time.Now().Unix()
-	var current int64
-	if userData.ExpiresAt != nil {
-		current = *userData.ExpiresAt
-	}
-	base := current
-	if base <= nowTS {
-		base = nowTS
-	}
-	exp := base + int64(days)*24*3600
-	userData.ExpiresAt = &exp
-	st.Users[userID] = userData
-	if err := m.SaveState(st); err != nil {
 		return 0, err
 	}
 	return exp, nil
 }
 
 func (m *Manager) SetNeverExpires(userID string, value bool) error {
-	st, err := m.LoadState()
-	if err != nil {
-		return err
-	}
-	m.SweepExpiredUsers(st, 0)
-	userData, ok := st.Users[userID]
-	if !ok {
-		return fmt.Errorf("user %s not found", userID)
-	}
-	userData.NeverExpires = value
-	if value {
-		userData.ExpiresAt = nil
-	} else {
-		m.EnsureUserExpiry(&userData)
-	}
-	st.Users[userID] = userData
-	return m.SaveState(st)
+	return m.WithState(func(st *config.State) error {
+		m.SweepExpiredUsers(st, 0)
+		userData, ok := st.Users[userID]
+		if !ok {
+			return fmt.Errorf("user %s not found", userID)
+		}
+		userData.NeverExpires = value
+		if value {
+			userData.ExpiresAt = nil
+		} else {
+			m.EnsureUserExpiry(&userData)
+		}
+		st.Users[userID] = userData
+		return nil
+	})
 }
 
 type TrafficStats struct {

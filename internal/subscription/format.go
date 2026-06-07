@@ -150,10 +150,8 @@ func (m *Manager) FormatTraffic() string {
 func (m *Manager) FormatSummary(st *config.State) string {
 	pending := 0
 	for _, req := range st.Requests {
-		if m, ok := req.(map[string]interface{}); ok {
-			if s, _ := m["status"].(string); s == "pending" {
-				pending++
-			}
+		if req.Status == "pending" {
+			pending++
 		}
 	}
 	nowTS := int64(0)

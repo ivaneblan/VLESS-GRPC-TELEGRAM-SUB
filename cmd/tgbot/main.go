@@ -10,6 +10,7 @@ import (
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/botapp"
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/config"
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/logx"
+	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/sshclient"
 )
 
 func main() {
@@ -27,6 +28,7 @@ func main() {
 	if cfg.Bot.ApproverUserID == 0 {
 		logx.L.Fatal().Msg("config: bot.approver_user_id is required")
 	}
+	sshclient.StrictHostKey = cfg.SSH.StrictHostKey
 	token, err := botapp.ReadBotToken(sec)
 	if err != nil {
 		logx.L.Fatal().Msg("no bot token: set TG_BOT_TOKEN or secrets.yaml telegram.bot_token")
@@ -47,5 +49,11 @@ func main() {
 		logx.L.Fatal().Err(err).Msg("create bot")
 	}
 	logx.L.Info().Msg("tgbot started, polling...")
+	// Start blocks until ctx is cancelled (SIGINT/SIGTERM via NotifyContext).
 	tg.Start(ctx)
+	// Graceful shutdown: state.yaml is always written synchronously under a lock
+	// during each update, so there is nothing to flush here; per-operation SSH
+	// connections are already closed via defer. Just stop signal handling and log.
+	cancel()
+	logx.L.Info().Msg("tgbot stopped")
 }

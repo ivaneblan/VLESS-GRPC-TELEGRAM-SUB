@@ -8,6 +8,15 @@ type Config struct {
 	Servers []ServerDef `yaml:"servers"`
 	// SubscriptionTitle is the group name shown in Happ (max 25 chars).
 	SubscriptionTitle string `yaml:"subscription_title,omitempty"`
+	// SSH holds connection-level options shared by all servers.
+	SSH SSHOptions `yaml:"ssh,omitempty"`
+}
+
+type SSHOptions struct {
+	// StrictHostKey, when true, refuses connecting to a host whose key is not
+	// already pinned in keys/known_hosts (no trust-on-first-use). Default false
+	// keeps TOFU behaviour: unknown hosts are learned, changed keys are rejected.
+	StrictHostKey bool `yaml:"strict_host_key,omitempty"`
 }
 
 type BotConfig struct {
@@ -79,10 +88,21 @@ type RealityKeys struct {
 }
 
 type State struct {
-	ApproverChatID    *int64                 `yaml:"approver_chat_id"`
-	LastExpirySweepAt int64                  `yaml:"last_expiry_sweep_at"`
-	Requests          map[string]interface{} `yaml:"requests"`
-	Users             map[string]UserEntry   `yaml:"users"`
+	ApproverChatID    *int64               `yaml:"approver_chat_id"`
+	LastExpirySweepAt int64                `yaml:"last_expiry_sweep_at"`
+	Requests          map[string]Request   `yaml:"requests"`
+	Users             map[string]UserEntry `yaml:"users"`
+}
+
+// Request is a pending/processed subscription request created via the Telegram
+// bot. It is stored in state.yaml keyed by request id.
+type Request struct {
+	RequestID string `yaml:"request_id"`
+	UserID    int64  `yaml:"user_id"`
+	Username  string `yaml:"username"`
+	FirstName string `yaml:"first_name"`
+	Status    string `yaml:"status"`
+	CreatedAt int64  `yaml:"created_at"`
 }
 
 type UserEntry struct {
