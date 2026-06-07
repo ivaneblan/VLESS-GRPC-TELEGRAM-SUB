@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/config"
+	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/logx"
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/sshclient"
 	"gopkg.in/yaml.v3"
 )
@@ -78,7 +79,7 @@ func Bot(paths config.Paths) error {
 		return fmt.Errorf("bot not active:\n%s", logOut)
 	}
 	_, logOut, _ := client.Run("journalctl -u "+serviceName+" -n 15 --no-pager", 30*time.Second)
-	fmt.Println(strings.TrimSpace(logOut))
+	logx.Infof("recent bot logs:\n%s", strings.TrimSpace(logOut))
 	logOK("bot deploy finished")
 	return nil
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/config"
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/links"
+	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/logx"
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/sshclient"
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/xray"
 )
@@ -226,7 +227,7 @@ func Backup(paths config.Paths) error {
 		if err := copyFile(backupPath, latestPath); err != nil {
 			return fmt.Errorf("backup %s latest: %w", name, err)
 		}
-		fmt.Printf("backup: %s\n", backupPath)
+		logx.Infof("backup: %s", backupPath)
 	}
 
 	metaPath := filepath.Join(paths.BackupDir, "snapshot-"+stamp+".txt")
@@ -253,8 +254,8 @@ func Backup(paths config.Paths) error {
 	if err := os.WriteFile(metaPath, []byte(meta.String()), 0o600); err != nil {
 		return err
 	}
-	fmt.Printf("snapshot: %s\n", metaPath)
-	fmt.Printf("users: %d\n", len(st.Users))
+	logx.Infof("snapshot: %s", metaPath)
+	logx.Infof("users: %d", len(st.Users))
 	return nil
 }
 

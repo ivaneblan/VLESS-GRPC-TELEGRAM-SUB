@@ -9,6 +9,7 @@ import (
 
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/config"
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/deploy"
+	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/logx"
 	"github.com/spf13/cobra"
 )
 
@@ -48,7 +49,17 @@ Typical first run:
 		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: false},
 	}
 	root.SetVersionTemplate("vpnctl {{.Version}}\n")
+
+	var (
+		logJSON bool
+		verbose bool
+	)
 	root.PersistentFlags().StringVarP(&paths.Root, "root", "C", paths.Root, "project root directory")
+	root.PersistentFlags().BoolVar(&logJSON, "log-json", false, "emit logs as JSON instead of pretty console")
+	root.PersistentFlags().BoolVar(&verbose, "verbose", false, "verbose (debug-level) logging")
+	root.PersistentPreRun = func(cmd *cobra.Command, args []string) {
+		logx.Setup(logJSON, verbose)
+	}
 
 	root.AddGroup(
 		&cobra.Group{ID: groupSetup, Title: "Setup & Lifecycle:"},
@@ -82,7 +93,7 @@ Typical first run:
 	)
 
 	if err := root.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, "Error:", err)
+		logx.Errf("%v", err)
 		os.Exit(1)
 	}
 }

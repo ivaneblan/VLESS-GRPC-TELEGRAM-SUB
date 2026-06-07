@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/config"
+	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/logx"
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/sshclient"
 )
 
@@ -31,22 +32,22 @@ func Deploy(client *sshclient.Client, cfg *config.Config, sec *config.Secrets, s
 
 	keys := sec.Reality(server.ID)
 	if forceKeys || keys.PublicKey == "" || keys.PrivateKey == "" || keys.ShortID == "" {
-		fmt.Println("  · generating Reality keys (xray x25519)...")
+		logx.Infof("generating Reality keys (xray x25519)...")
 		var err error
 		keys, err = generateRealityKeys(client)
 		if err != nil {
 			return nil, err
 		}
-		fmt.Println("  ✓ new Reality keys generated")
+		logx.Infof("new Reality keys generated")
 	} else {
-		fmt.Printf("  · reusing Reality keys for %s\n", server.ID)
+		logx.Infof("reusing Reality keys for %s", server.ID)
 	}
 
 	if len(uuids) == 0 {
 		if allowEmptyClients {
-			fmt.Println("  · no users yet — xray with empty client list")
+			logx.Infof("no users yet — xray with empty client list")
 		} else {
-			fmt.Println("  · no users in state — generating placeholder UUID")
+			logx.Infof("no users in state — generating placeholder UUID")
 			id, err := genUUID(client)
 			if err != nil {
 				return nil, err
@@ -55,7 +56,7 @@ func Deploy(client *sshclient.Client, cfg *config.Config, sec *config.Secrets, s
 		}
 	}
 
-	fmt.Printf("  · writing xray config (%d client UUIDs)...\n", len(uuids))
+	logx.Infof("writing xray config (%d client UUIDs)...", len(uuids))
 	var xrayCfg map[string]interface{}
 	if server.IsBridge() {
 		exit := cfg.ExitForBridge(server)
@@ -71,7 +72,7 @@ func Deploy(client *sshclient.Client, cfg *config.Config, sec *config.Secrets, s
 		}
 		relayUUID := strings.TrimSpace(sec.RelayUUID(server.ID))
 		if relayUUID == "" {
-			fmt.Println("  · generating relay UUID (bridge -> exit)...")
+			logx.Infof("generating relay UUID (bridge -> exit)...")
 			id, err := genUUID(client)
 			if err != nil {
 				return nil, err
@@ -79,7 +80,7 @@ func Deploy(client *sshclient.Client, cfg *config.Config, sec *config.Secrets, s
 			relayUUID = id
 			sec.SetRelayUUID(server.ID, relayUUID)
 		}
-		fmt.Printf("  · bridge mode: forwarding to exit %s (%s:%d) via VLESS\n", exit.ID, exit.Host, x.Port)
+		logx.Infof("bridge mode: forwarding to exit %s (%s:%d) via VLESS", exit.ID, exit.Host, x.Port)
 		xrayCfg = buildRelayConfig(uuids, x, keys.PrivateKey, keys.ShortID, exit.Host, x.Port, exitKeys.PublicKey, exitKeys.ShortID, relayUUID)
 	} else {
 		xrayCfg = buildConfig(uuids, x, keys.PrivateKey, keys.ShortID)
@@ -89,26 +90,26 @@ func Deploy(client *sshclient.Client, cfg *config.Config, sec *config.Secrets, s
 		return nil, err
 	}
 
-	fmt.Println("  · configuring firewall + systemd...")
+	logx.Infof("configuring firewall + systemd...")
 	_, _, _ = client.Run("command -v ufw >/dev/null 2>&1 && ufw allow 443/tcp || true", 30*time.Second)
 	_, _, _ = client.Run("systemctl daemon-reload", 30*time.Second)
 	_, _, _ = client.Run("systemctl enable xray", 30*time.Second)
 
 	if changed || freshInstall {
 		if freshInstall {
-			fmt.Println("  · restarting xray (fresh install)...")
+			logx.Infof("restarting xray (fresh install)...")
 		} else {
-			fmt.Println("  · restarting xray (config changed)...")
+			logx.Infof("restarting xray (config changed)...")
 		}
 		if err := restartXray(client); err != nil {
 			return nil, err
 		}
-		fmt.Println("  ✓ xray config updated and restarted")
+		logx.Infof("xray config updated and restarted")
 	} else {
-		fmt.Println("  · xray config unchanged")
+		logx.Infof("xray config unchanged")
 		_, out, _ := client.Run("systemctl is-active xray", 15*time.Second)
 		if strings.TrimSpace(out) != "active" {
-			fmt.Println("  · xray not active — restarting...")
+			logx.Infof("xray not active — restarting...")
 			if err := restartXray(client); err != nil {
 				return nil, err
 			}
@@ -168,18 +169,18 @@ func ensureInstalled(client *sshclient.Client, version string) (bool, error) {
 	if installed {
 		current := strings.Split(strings.TrimSpace(out), "\n")[0]
 		if version == "" || strings.Contains(current, version) {
-			fmt.Printf("  ✓ xray already installed: %s\n", current)
+			logx.Infof("xray already installed: %s", current)
 			return false, nil
 		}
-		fmt.Printf("  · xray %s installed, switching to pinned %s...\n", current, version)
+		logx.Infof("xray %s installed, switching to pinned %s...", current, version)
 	}
 
 	versionArg := ""
 	if version != "" {
 		versionArg = " --version " + version
-		fmt.Printf("  · installing xray %s (live output, 2–5 min)...\n", version)
+		logx.Infof("installing xray %s (live output, 2–5 min)...", version)
 	} else {
-		fmt.Println("  · installing xray latest (live output, 2–5 min)...")
+		logx.Infof("installing xray latest (live output, 2–5 min)...")
 	}
 	installScript := fmt.Sprintf(`set -e
 echo "[xray] preparing dependencies (unzip, curl)..."
@@ -200,7 +201,7 @@ echo "[xray] install finished"
 	if rc != 0 {
 		return false, fmt.Errorf("xray install failed: %s %s", out, errStr)
 	}
-	fmt.Println("  ✓ xray installed")
+	logx.Infof("xray installed")
 	return true, nil
 }
 

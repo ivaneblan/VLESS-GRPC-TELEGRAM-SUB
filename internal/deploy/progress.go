@@ -1,28 +1,25 @@
 package deploy
 
-import (
-	"fmt"
-	"os"
-)
+import "github.com/ivaneblan/vless-grpc-telegram-sub/internal/logx"
 
 func phase(title string) {
-	fmt.Printf("\n>>> %s\n", title)
+	logx.Phase(title)
 }
 
 func step(n, total int, msg string) {
-	fmt.Printf("  [%d/%d] %s\n", n, total, msg)
+	logx.Step(n, total, msg)
 }
 
 func logf(msg string, args ...interface{}) {
-	fmt.Printf("  · "+msg+"\n", args...)
+	logx.Infof(msg, args...)
 }
 
 func logOK(msg string, args ...interface{}) {
-	fmt.Printf("  ✓ "+msg+"\n", args...)
+	logx.Infof(msg, args...)
 }
 
 func logErr(msg string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "  ✗ "+msg+"\n", args...)
+	logx.Errf(msg, args...)
 }
 
 func connectMsg(host string) {

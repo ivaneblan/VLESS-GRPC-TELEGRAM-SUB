@@ -1,8 +1,9 @@
 package deploy
 
 import (
-	"fmt"
 	"os"
+
+	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/logx"
 )
 
 func copyIfMissing(dst, src string) {
@@ -12,7 +13,7 @@ func copyIfMissing(dst, src string) {
 	if err := copyFile(src, dst); err != nil {
 		return
 	}
-	fmt.Println("created", dst)
+	logx.Infof("created %s", dst)
 }
 
 func copyFile(src, dst string) error {
