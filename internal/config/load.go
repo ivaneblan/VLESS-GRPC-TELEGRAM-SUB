@@ -120,6 +120,10 @@ func LoadState(path string) (*State, error) {
 		}
 		return nil, err
 	}
+	return ParseState(data)
+}
+
+func ParseState(data []byte) (*State, error) {
 	var st State
 	if err := yaml.Unmarshal(data, &st); err != nil {
 		return nil, err

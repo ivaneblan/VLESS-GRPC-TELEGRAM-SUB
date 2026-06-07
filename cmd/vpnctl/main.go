@@ -67,7 +67,7 @@ Typical first run:
 		// Deploy & components
 		simpleCmd(&paths, groupDeploy, "keys", "Install SSH public key on all servers", deploy.Keys),
 		vlessCmd(&paths),
-		simpleCmd(&paths, groupDeploy, "bot", "Deploy Telegram bot (tgbot) via systemd", deploy.Bot),
+		botCmd(&paths),
 		linksCmd(&paths),
 
 		// Subscribers & servers
@@ -220,6 +220,38 @@ func vlessCmd(paths *config.Paths) *cobra.Command {
 	return c
 }
 
+func botCmd(paths *config.Paths) *cobra.Command {
+	bot := &cobra.Command{
+		Use:     "bot",
+		Short:   "Deploy Telegram bot (tgbot) via systemd",
+		GroupID: groupDeploy,
+		Long: `Deploy the Telegram bot, or sync its state.
+
+Run without a subcommand to (re)deploy the bot. The bot keeps its own
+state.yaml on the bot server and writes users added via Telegram there.
+Before redeploying, run "vpnctl bot pull-state" to copy those users back,
+otherwise the deploy overwrites the server state with your local copy.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			*paths = config.DefaultPaths(paths.Root)
+			return deploy.Bot(*paths)
+		},
+	}
+	bot.AddCommand(&cobra.Command{
+		Use:   "pull-state",
+		Short: "Download state.yaml from the bot server (backs up local first)",
+		Long: `Copies the live state.yaml from the bot server into your local state.yaml,
+backing up the current local file as state.yaml.<timestamp>.bak.
+
+Use this to pick up users that were added through the Telegram bot before
+running any CLI command or redeploying the bot.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			*paths = config.DefaultPaths(paths.Root)
+			return deploy.BotPullState(*paths)
+		},
+	})
+	return bot
+}
+
 func linksCmd(paths *config.Paths) *cobra.Command {
 	links := &cobra.Command{
 		Use:     "links",
@@ -314,6 +346,28 @@ func usersCmd(paths *config.Paths) *cobra.Command {
 		},
 	}
 
+	var syncAll bool
+	sync := &cobra.Command{
+		Use:     "sync [USER_ID]",
+		Short:   "Add user to newly added servers (use --all for everyone)",
+		Example: "  vpnctl users sync alice\n  vpnctl users sync --all",
+		Args:    cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			*paths = config.DefaultPaths(paths.Root)
+			if syncAll {
+				if len(args) > 0 {
+					return fmt.Errorf("--all syncs every user; do not pass USER_ID")
+				}
+				return deploy.UsersSyncAll(*paths)
+			}
+			if len(args) != 1 {
+				return fmt.Errorf("provide USER_ID or use --all")
+			}
+			return deploy.UsersSync(*paths, args[0])
+		},
+	}
+	sync.Flags().BoolVar(&syncAll, "all", false, "sync all users to all servers")
+
 	users.AddCommand(
 		&cobra.Command{
 			Use:     "list",
@@ -337,15 +391,7 @@ func usersCmd(paths *config.Paths) *cobra.Command {
 				return deploy.UsersRevoke(*paths, args[0])
 			},
 		},
-		&cobra.Command{
-			Use:   "sync USER_ID",
-			Short: "Add user to newly added servers",
-			Args:  cobra.ExactArgs(1),
-			RunE: func(cmd *cobra.Command, args []string) error {
-				*paths = config.DefaultPaths(paths.Root)
-				return deploy.UsersSync(*paths, args[0])
-			},
-		},
+		sync,
 		renew,
 		never,
 		&cobra.Command{

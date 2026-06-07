@@ -332,3 +332,17 @@ func MkdirRemote(c *Client, path string) error {
 	defer sftpClient.Close()
 	return sftpClient.MkdirAll(path)
 }
+
+func DownloadBytes(c *Client, remotePath string) ([]byte, error) {
+	sftpClient, err := c.SFTP()
+	if err != nil {
+		return nil, err
+	}
+	defer sftpClient.Close()
+	f, err := sftpClient.Open(remotePath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
+}

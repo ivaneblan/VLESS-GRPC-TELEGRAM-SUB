@@ -1,6 +1,9 @@
 package deploy
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+)
 
 func phase(title string) {
 	fmt.Printf("\n>>> %s\n", title)
@@ -16,6 +19,10 @@ func logf(msg string, args ...interface{}) {
 
 func logOK(msg string, args ...interface{}) {
 	fmt.Printf("  ✓ "+msg+"\n", args...)
+}
+
+func logErr(msg string, args ...interface{}) {
+	fmt.Fprintf(os.Stderr, "  ✗ "+msg+"\n", args...)
 }
 
 func connectMsg(host string) {

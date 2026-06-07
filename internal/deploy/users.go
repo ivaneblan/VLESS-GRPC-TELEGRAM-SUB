@@ -3,6 +3,7 @@ package deploy
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/ivaneblan/vless-grpc-telegram-sub/internal/config"
@@ -115,6 +116,45 @@ func UsersSync(paths config.Paths, userID string) error {
 		return nil
 	}
 	logOK("user %s synced, added: %s", userID, strings.Join(added, ", "))
+	return nil
+}
+
+func UsersSyncAll(paths config.Paths) error {
+	m, err := manager(paths)
+	if err != nil {
+		return err
+	}
+	st, err := m.LoadState()
+	if err != nil {
+		return err
+	}
+	if len(st.Users) == 0 {
+		logOK("no users to sync")
+		return nil
+	}
+	ids := make([]string, 0, len(st.Users))
+	for id := range st.Users {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	var changed, failed int
+	for _, id := range ids {
+		added, err := m.SyncUser(id)
+		if err != nil {
+			logErr("user %s: %v", id, err)
+			failed++
+			continue
+		}
+		if len(added) > 0 {
+			logOK("user %s synced, added: %s", id, strings.Join(added, ", "))
+			changed++
+		}
+	}
+	logOK("sync-all done: %d updated, %d already in sync, %d failed", changed, len(ids)-changed-failed, failed)
+	if failed > 0 {
+		return fmt.Errorf("%d user(s) failed to sync", failed)
+	}
 	return nil
 }
 

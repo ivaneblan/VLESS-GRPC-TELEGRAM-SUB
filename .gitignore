@@ -2,6 +2,11 @@
 config.yaml
 secrets.yaml
 state.yaml
+# Timestamped backups created by vpnctl (passwd / bot pull-state)
+config.yaml.*
+secrets.yaml.*
+state.yaml.*
+*.bak
 keys/
 backups/
 telemt_socks5.md

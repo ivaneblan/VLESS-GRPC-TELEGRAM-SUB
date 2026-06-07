@@ -83,6 +83,60 @@ func Bot(paths config.Paths) error {
 	return nil
 }
 
+// BotPullState downloads the live state.yaml from the bot server (the bot is
+// the source of truth while running) into the local state.yaml, backing up the
+// current local copy first. Use it before redeploying the bot so that users
+// added via Telegram are not lost.
+func BotPullState(paths config.Paths) error {
+	cfg, sec, _, err := config.LoadAll(paths)
+	if err != nil {
+		return err
+	}
+	botServer := cfg.BotServer()
+	if botServer == nil {
+		return fmt.Errorf("bot server not configured")
+	}
+	logf("bot node: %s (%s @ %s)", botServer.Name, botServer.ID, botServer.Host)
+
+	connectMsg(botServer.Host)
+	client, err := sshclient.Connect(botServer.Host, sec, botServer.ID)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	connectedMsg(botServer.Host)
+
+	remoteState := remoteRoot + "/state.yaml"
+	logf("download %s", remoteState)
+	data, err := sshclient.DownloadBytes(client, remoteState)
+	if err != nil {
+		return fmt.Errorf("download remote state.yaml: %w", err)
+	}
+	if len(strings.TrimSpace(string(data))) == 0 {
+		return fmt.Errorf("remote state.yaml is empty, refusing to overwrite local")
+	}
+
+	st, err := config.ParseState(data)
+	if err != nil {
+		return fmt.Errorf("remote state.yaml is invalid: %w", err)
+	}
+
+	if _, err := os.Stat(paths.StatePath); err == nil {
+		backup := paths.StatePath + "." + time.Now().Format("20060102-150405") + ".bak"
+		if cur, rerr := os.ReadFile(paths.StatePath); rerr == nil {
+			if werr := os.WriteFile(backup, cur, 0o644); werr == nil {
+				logOK("local state backed up: %s", filepath.Base(backup))
+			}
+		}
+	}
+
+	if err := os.WriteFile(paths.StatePath, data, 0o644); err != nil {
+		return fmt.Errorf("write local state.yaml: %w", err)
+	}
+	logOK("pulled state.yaml from bot (%d users)", len(st.Users))
+	return nil
+}
+
 func ensureBotBinary(paths config.Paths) error {
 	local := filepath.Join(paths.Root, filepath.FromSlash(localBotLinux))
 	if _, err := os.Stat(local); err == nil {
