@@ -49,8 +49,8 @@ make build    # или: go build -o vpnctl ./cmd/vpnctl
 | Новый VPS, пользователей нет | `vpnctl bootstrap` или `bootstrap --no-bot` |
 | Новый VPS, сначала очистить старый стек | `vpnctl bootstrap --cleanup` |
 | Переустановка, подписчиков сохранить | `vpnctl redeploy` |
-| Добавить сервер к существующей схеме | правка `config.yaml` → `vpnctl vless newid` → `vpnctl users sync ID` для каждого пользователя |
-| Добавить RU-мост (обход ТСПУ) | в `config.yaml` сервер с `relay_to: <exit_id>` → `vpnctl keys` → `vpnctl vless` → `vpnctl links refresh` |
+| Добавить сервер к существующей схеме | правка `config.yaml` → `vpnctl bot pull-state` (если есть бот) → `vpnctl vless newid` → `vpnctl users sync --all` |
+| Добавить RU-мост (обход ТСПУ) | в `config.yaml` сервер с `relay_to: <exit_id>` → `vpnctl keys` → `vpnctl vless` → `vpnctl bot pull-state` (если есть бот) → `vpnctl users sync --all` |
 | Перед redeploy бота подтянуть пользователей с VPS | `vpnctl bot pull-state` |
 | Redeploy бота, перезаписав state на VPS локальным | `vpnctl bot --force-state` (осторожно) |
 
@@ -155,12 +155,33 @@ make build    # или: go build -o vpnctl ./cmd/vpnctl
 | `show ID [--format links\|all\|happ\|json]` | Показать ссылки (`links` — только gRPC по умолчанию) |
 | `export ID [-o file]` | Блок подписки для Happ / отправки файлом |
 | `revoke ID` | Удалить из `state.yaml` и Xray |
-| `sync ID` | Добавить существующий UUID на новые серверы |
+| `sync ID` | Добавить существующий UUID на серверы, где пользователя ещё нет (Xray + ссылки в `state.yaml`) |
+| `sync --all` | То же для **всех** пользователей из `state.yaml` |
 | `renew ID DAYS` | Продлить подписку |
 | `never ID on\|off` | Вкл/выкл бессрочную подписку |
 | `sweep` | Удалить просроченных из state и Xray |
 
 `ID` — любая строка: числовой Telegram id (`123456789`) или произвольный ключ (`client-ivan`).
+
+**Синхронизация пользователей на серверах**
+
+Команда `sync` не создаёт нового пользователя и не меняет UUID. Она проверяет **локальный** `state.yaml` и для каждого сервера из `config.yaml`, где у пользователя ещё нет записи:
+
+1. регистрирует существующий UUID в Xray на этом узле;
+2. собирает VLESS-ссылки и дописывает их в `state.yaml`.
+
+Нужна после добавления нового VPS/моста в `config.yaml` и деплоя (`vpnctl vless`), если пользователи были созданы раньше. Для одного человека — `sync ID`, для всех сразу — `sync --all`. Если пользователь уже есть на всех узлах, команда сообщит об этом и ничего не изменит.
+
+**Перед `sync --all`, если работает Telegram-бот:** сначала подтяните актуальный state с VPS бота — иначе CLI не увидит пользователей, добавленных через Telegram, и синхронизирует неполный список:
+
+```powershell
+vpnctl bot pull-state   # VPS → локальный state.yaml (старый локальный файл бэкапится)
+vpnctl users sync --all
+```
+
+`pull-state` нужен только когда каноничная копия живёт на VPS (`bot.server_id`). В режиме только CLI этот шаг пропускайте.
+
+В Telegram-боте то же самое для одного пользователя: `/sync_user <user_id>` или кнопка «🔄 Синхрон user_id» в админ-меню (бот читает state с VPS напрямую, `pull-state` ему не нужен).
 
 **Примеры:**
 
@@ -171,6 +192,10 @@ vpnctl users show client-ivan --format happ
 vpnctl users export client-ivan -o subscription.txt
 vpnctl users renew client-ivan 30
 vpnctl users revoke client-ivan
+# после добавления сервера в config.yaml и vpnctl vless ru1 (с ботом):
+vpnctl bot pull-state
+vpnctl users sync --all
+vpnctl users sync client-ivan
 ```
 
 ### Серверы (`vpnctl servers`)
@@ -216,7 +241,7 @@ vpnctl bot
 vpnctl bot --force-state
 ```
 
-Функции бота дублируют CLI: одобрение заявок, создание пользователя/подписки (кнопка «➕ Создать пользователя» или `/add_user <user_id> [days|never] [label]`, аналог `vpnctl users add`), renew/revoke/sync, трафик и статус. Нужны `telegram.bot_token` и `bot.approver_user_id` в конфиге.
+Функции бота дублируют CLI: одобрение заявок, создание пользователя/подписки (кнопка «➕ Создать пользователя» или `/add_user <user_id> [days|never] [label]`, аналог `vpnctl users add`), renew/revoke, синхронизация на новые серверы (`/sync_user <user_id>` или кнопка «🔄 Синхрон user_id», аналог `vpnctl users sync`), трафик и статус. Нужны `telegram.bot_token` и `bot.approver_user_id` в конфиге.
 
 Локальная разработка (нужен доступ к `api.telegram.org`):
 
